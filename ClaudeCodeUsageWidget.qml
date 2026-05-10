@@ -241,47 +241,70 @@ PluginComponent {
         }
     }
 
-    // --- Taskbar pills (show 5h utilization) ---
+    // --- Taskbar pills (show 5h + 7d utilization as concentric rings) ---
+    //
+    // Outer arc = 5-hour window (the urgent metric — burns fast in active
+    // sessions, what triggers throttling). Inner arc = 7-day rolling cap.
+    // Both arcs use progressColor() so they redden independently as
+    // utilization climbs. A single canvas at two radii is more compact
+    // than side-by-side rings, which matters on the vertical bar pill
+    // where horizontal width is the narrow dimension.
+
+    component DualRing: Canvas {
+        property real fiveHour: 0
+        property real sevenDay: 0
+        renderStrategy: Canvas.Cooperative
+        onFiveHourChanged: requestPaint()
+        onSevenDayChanged: requestPaint()
+
+        onPaint: {
+            var ctx = getContext("2d")
+            ctx.reset()
+            var cx = width / 2, cy = height / 2
+            var lw = 2.5
+            // Outer ring (5h) hugs the canvas edge; inner (7d) is offset
+            // by lineWidth + 1px gap so the strokes don't bleed into each
+            // other.
+            var rOuter = (Math.min(width, height) / 2) - (lw / 2) - 0.5
+            var rInner = rOuter - lw - 1
+
+            function drawRing(radius, percent) {
+                ctx.beginPath()
+                ctx.arc(cx, cy, radius, 0, 2 * Math.PI)
+                ctx.lineWidth = lw
+                ctx.strokeStyle = Theme.surfaceVariant
+                ctx.stroke()
+
+                var pct = percent / 100
+                if (pct > 0) {
+                    ctx.beginPath()
+                    ctx.arc(cx, cy, radius, -Math.PI / 2, -Math.PI / 2 + 2 * Math.PI * Math.min(pct, 1))
+                    ctx.lineWidth = lw
+                    ctx.strokeStyle = root.progressColor(percent)
+                    ctx.lineCap = "round"
+                    ctx.stroke()
+                }
+            }
+
+            drawRing(rOuter, fiveHour)
+            drawRing(rInner, sevenDay)
+        }
+    }
 
     horizontalBarPill: Component {
         Row {
             spacing: Theme.spacingXS
 
-            Canvas {
-                id: hRing
-                width: 20
-                height: 20
+            DualRing {
+                width: 22
+                height: 22
                 anchors.verticalCenter: parent.verticalCenter
-                renderStrategy: Canvas.Cooperative
-
-                property real percent: root.fiveHourUtil
-                onPercentChanged: requestPaint()
-
-                onPaint: {
-                    var ctx = getContext("2d")
-                    ctx.reset()
-                    var cx = width / 2, cy = height / 2, r = 7.5, lw = 2.5
-
-                    ctx.beginPath()
-                    ctx.arc(cx, cy, r, 0, 2 * Math.PI)
-                    ctx.lineWidth = lw
-                    ctx.strokeStyle = Theme.surfaceVariant
-                    ctx.stroke()
-
-                    var pct = percent / 100
-                    if (pct > 0) {
-                        ctx.beginPath()
-                        ctx.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + 2 * Math.PI * Math.min(pct, 1))
-                        ctx.lineWidth = lw
-                        ctx.strokeStyle = root.progressColor(percent)
-                        ctx.lineCap = "round"
-                        ctx.stroke()
-                    }
-                }
+                fiveHour: root.fiveHourUtil
+                sevenDay: root.sevenDayUtil
             }
 
             StyledText {
-                text: Math.round(root.fiveHourUtil) + "%"
+                text: Math.round(root.fiveHourUtil) + "/" + Math.round(root.sevenDayUtil) + "%"
                 font.pixelSize: Theme.fontSizeSmall
                 color: Theme.surfaceText
                 anchors.verticalCenter: parent.verticalCenter
@@ -293,41 +316,20 @@ PluginComponent {
         Column {
             spacing: Theme.spacingXS || 4
 
-            Canvas {
-                id: vRing
-                width: 20
-                height: 20
+            DualRing {
+                width: 22
+                height: 22
                 anchors.horizontalCenter: parent.horizontalCenter
-                renderStrategy: Canvas.Cooperative
-
-                property real percent: root.fiveHourUtil
-                onPercentChanged: requestPaint()
-
-                onPaint: {
-                    var ctx = getContext("2d")
-                    ctx.reset()
-                    var cx = width / 2, cy = height / 2, r = 7.5, lw = 2.5
-
-                    ctx.beginPath()
-                    ctx.arc(cx, cy, r, 0, 2 * Math.PI)
-                    ctx.lineWidth = lw
-                    ctx.strokeStyle = Theme.surfaceVariant
-                    ctx.stroke()
-
-                    var pct = percent / 100
-                    if (pct > 0) {
-                        ctx.beginPath()
-                        ctx.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + 2 * Math.PI * Math.min(pct, 1))
-                        ctx.lineWidth = lw
-                        ctx.strokeStyle = root.progressColor(percent)
-                        ctx.lineCap = "round"
-                        ctx.stroke()
-                    }
-                }
+                fiveHour: root.fiveHourUtil
+                sevenDay: root.sevenDayUtil
             }
 
             StyledText {
-                text: Math.round(root.fiveHourUtil) + "%"
+                // Vertical bars are width-constrained — stack the two
+                // percentages on separate lines instead of joining them
+                // with a slash to avoid clipping at narrow bar widths.
+                text: Math.round(root.fiveHourUtil) + "%\n" + Math.round(root.sevenDayUtil) + "%"
+                horizontalAlignment: Text.AlignHCenter
                 font.pixelSize: Theme.fontSizeSmall
                 color: Theme.surfaceText
                 anchors.horizontalCenter: parent.horizontalCenter
