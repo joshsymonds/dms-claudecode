@@ -452,33 +452,42 @@ PluginComponent {
 
     // --- Popout ---
 
+    // Wrap PopoutComponent (a Column positioner whose implicitHeight is
+    // read-only and reassignment errors with `"implicitHeight" is a read-only
+    // property`) in an Item we control. The framework's
+    // PluginPopout.onLoaded binds `contentHeight = item.implicitHeight + ...`
+    // against THIS Item, so we drive `implicitHeight` from cardsCol's
+    // deterministic sum directly — bypasses the auto-cascade timing
+    // window that intermittently captured a stale value on first paint.
+    // closePopout and parentPopout must be forwarded so the framework's
+    // wiring still reaches the inner PopoutComponent's close button.
     popoutContent: Component {
-        PopoutComponent {
-            id: popoutRoot
-            headerText: root.tr("Claude Code Usage")
-            detailsText: root.rateLimitTier ? root.tr("Subscription") + " : " + root.formatTier(root.rateLimitTier) : ""
-            showCloseButton: true
+        Item {
+            id: popoutWrapper
+            property var closePopout: null
+            property var parentPopout: null
+            implicitWidth: popoutRoot.implicitWidth
+            implicitHeight: cardsCol.implicitHeight + popoutRoot.headerHeight + popoutRoot.detailsHeight + Theme.spacingL * 2
 
-            // Explicit implicitHeight bypasses Qt's Column-positioner
-            // auto-cascade, which intermittently captures a stale/partial
-            // value at the moment PluginPopout.onLoaded fires its
-            // Qt.binding(() => item.implicitHeight + ...). Driving from
-            // cardsCol.implicitHeight (which is a deterministic sum of
-            // explicit card heights) plus the PopoutComponent's own
-            // header/details chrome makes every open render at the right
-            // height on the first frame.
-            implicitHeight: cardsCol.implicitHeight + headerHeight + detailsHeight + Theme.spacingL * 2
+            PopoutComponent {
+                id: popoutRoot
+                anchors.fill: parent
+                headerText: root.tr("Claude Code Usage")
+                detailsText: root.rateLimitTier ? root.tr("Subscription") + " : " + root.formatTier(root.rateLimitTier) : ""
+                showCloseButton: true
+                closePopout: popoutWrapper.closePopout
+                parentPopout: popoutWrapper.parentPopout
 
-            // Inner cards Column. Uses x/width positioning instead of
-            // anchors.horizontalCenter because the parent PopoutComponent
-            // is itself a Column positioner: anchoring inside a positioner
-            // makes Qt drop this child from the parent's implicitHeight
-            // computation, which would break the auto-sizing path.
-            Column {
-                id: cardsCol
-                width: parent.width - Theme.spacingM * 2
-                x: Theme.spacingM
-                spacing: Theme.spacingL
+                // Inner cards Column. Uses x/width positioning instead of
+                // anchors.horizontalCenter because the parent PopoutComponent
+                // is itself a Column positioner: anchoring inside a positioner
+                // makes Qt drop this child from the parent's implicitHeight
+                // computation, which would break the auto-sizing path.
+                Column {
+                    id: cardsCol
+                    width: parent.width - Theme.spacingM * 2
+                    x: Theme.spacingM
+                    spacing: Theme.spacingL
 
                 // --- 5h Rate Window card ---
                 StyledRect {
@@ -1117,8 +1126,9 @@ PluginComponent {
                     }
                 }
 
-                // Bottom padding to match sides (compensates Column spacing)
-                Item { width: 1; height: 1 }
+                    // Bottom padding to match sides (compensates Column spacing)
+                    Item { width: 1; height: 1 }
+                }
             }
         }
     }
