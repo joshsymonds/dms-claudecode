@@ -60,6 +60,7 @@ esac
 
 PROJECTS="$PROFILE_DIR/projects"
 PRICING_CACHE="$HOME/.claude/pricing-cache.json"
+LITELLM_URL="https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 
 HOSTNAME_NOW="$(uname -n)"
 TODAY=$(date +%Y-%m-%d)
@@ -68,10 +69,54 @@ WEEK_START=$(date -d "$((DOW - 1)) days ago" +%Y-%m-%d)
 MONTH_START=$(date +%Y-%m-01)
 GENERATED="$(date -Iseconds)"
 
+# Self-bootstrap the pricing cache. On hosts that never run
+# get-claude-usage (any host that isn't gnomon — the only widget host),
+# ~/.claude/pricing-cache.json would otherwise never exist and every
+# cost computation here would silently yield zero despite real token
+# usage. Fetch from LiteLLM once per day; on failure leave costs at
+# zero rather than abort the summary run.
+refresh_pricing() {
+    local raw result eur_rate check
+    raw=$(curl -s --max-time 10 "$LITELLM_URL" 2>/dev/null) || return 1
+    result=$(echo "$raw" | jq -c '{
+        updated: "'"$TODAY"'",
+        models: ([to_entries[]
+            | select(.key | test("^claude-[a-z]+-[0-9]+-[0-9]+$"))
+            | select(.value.input_cost_per_token > 0)
+            | { family: (.key | split("-") | .[1]), key: .key, value: .value }
+        ] | group_by(.family)
+          | map(sort_by(.key) | last
+              | {key: .family, value: {
+                    input: .value.input_cost_per_token,
+                    output: .value.output_cost_per_token,
+                    cache_read: .value.cache_read_input_token_cost,
+                    cache_write: .value.cache_creation_input_token_cost
+                }})
+          | from_entries)
+    }' 2>/dev/null) || return 1
+    eur_rate=$(curl -s --max-time 5 "https://api.frankfurter.app/latest?from=USD&to=EUR" 2>/dev/null \
+        | jq -r '.rates.EUR // empty' 2>/dev/null) || eur_rate=""
+    if [ -n "$eur_rate" ] && [[ "$eur_rate" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+        result=$(echo "$result" | jq -c '. + {usd_eur_rate: '"$eur_rate"'}' 2>/dev/null)
+    fi
+    check=$(echo "$result" | jq -r '.models | to_entries | length' 2>/dev/null) || return 1
+    [ "$check" -gt 0 ] 2>/dev/null && mkdir -p "$(dirname "$PRICING_CACHE")" && echo "$result" > "$PRICING_CACHE" && return 0
+    return 1
+}
+
+# Only refresh when the cache is entirely missing — this is the
+# bootstrap path for hosts that never run get-claude-usage. Staleness
+# is gnomon's responsibility via get-claude-usage's daily refresh; we
+# don't want every host hammering LiteLLM and we don't want tests with
+# pre-seeded stale caches to trigger network calls.
+if [ ! -f "$PRICING_CACHE" ]; then
+    refresh_pricing || true
+fi
+
 # Awk-friendly pricing string: "opus:input:output:cache_read:cache_write,sonnet:...,haiku:..."
 # Personal-profile pricing-cache.json is reused across profiles — pricing is
-# global, not per-profile. If unavailable, costs come out as zero and the
-# bar shows token totals only.
+# global, not per-profile. If still unavailable after refresh attempt (no
+# network, etc.), costs come out as zero and the bar shows token totals only.
 PRICING_AWK=""
 if [ -f "$PRICING_CACHE" ]; then
     PRICING_AWK=$(jq -r '
@@ -113,7 +158,7 @@ done
 RESULT=$(find -H "$PROJECTS" -name '*.jsonl' -mtime -31 -exec cat {} + 2>/dev/null \
     | jq -r -R 'fromjson?
         | select(.type == "assistant")
-        | "\(.timestamp[:10]) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0) \(.sessionId // "unknown")"' \
+        | "\(.timestamp[:10]) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0) \(.sessionId // "unknown") \(.message.id // "no-id")"' \
     | awk -v today="$TODAY" -v week_start="$WEEK_START" -v month_start="$MONTH_START" -v day_dates="$DAY_DATES" -v pricing="$PRICING_AWK" '
 BEGIN {
     split(day_dates, dates, ",")
@@ -133,7 +178,20 @@ BEGIN {
 {
     date = $1; model = $2
     inp = $3 + 0; out = $4 + 0; cr = $5 + 0; cw = $6 + 0
-    sess = $7
+    sess = $7; msg_id = $8
+
+    # Dedup by message_id. Claude Code emits multiple "assistant" JSONL
+    # records per single API call (intermediate streaming chunks + final
+    # message), each carrying the SAME message.id and the SAME
+    # cumulative usage block. Counting them all roughly doubled
+    # cache_read totals and overstated cost ~2x vs the actual Bedrock
+    # bill. message.id is missing on pre-cache-tracking fixtures and
+    # very old records — treat "no-id" as unique to avoid collapsing
+    # legitimately separate calls together.
+    if (msg_id != "no-id") {
+        if (msg_id in seen_msg) next
+        seen_msg[msg_id] = 1
+    }
     total = inp + out + cr + cw
 
     # Extract family from model name (claude-{family}-{version...})

@@ -81,6 +81,17 @@ function formatCost(usd, lang, usdEurRate) {
     return sym + n.toFixed(2) + suffix
 }
 
+function formatCostCompact(usd, lang, usdEurRate) {
+    var useEur = lang === "fr" && usdEurRate > 0
+    var n = useEur ? usd * usdEurRate : usd
+    var sym = useEur ? "" : "$"
+    var suffix = useEur ? "€" : ""
+    if (n >= 1000000) return sym + Math.round(n / 1000000) + "M" + suffix
+    if (n >= 10000)   return sym + Math.round(n / 1000) + "k" + suffix
+    if (n >= 1000)    return sym + (n / 1000).toFixed(1) + "k" + suffix
+    return sym + Math.round(n) + suffix
+}
+
 function todayIndex() {
     var dow = new Date().getDay() // 0=Sunday, 6=Saturday
     return dow === 0 ? 6 : dow - 1

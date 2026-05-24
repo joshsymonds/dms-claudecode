@@ -180,6 +180,20 @@ PluginComponent {
         return sym + n.toFixed(2) + suffix
     }
 
+    // Glance-format for the bar pill — never more than 5 chars including
+    // the symbol so the vertical pill stays the same width as the rings.
+    // Examples: "$0", "$5", "$34", "$487", "$1.2k", "$12k", "$487k".
+    function formatCostCompact(usd) {
+        var useEur = lang === "fr" && usdEurRate > 0
+        var n = useEur ? usd * usdEurRate : usd
+        var sym = useEur ? "" : "$"
+        var suffix = useEur ? "€" : ""
+        if (n >= 1000000) return sym + Math.round(n / 1000000) + "M" + suffix
+        if (n >= 10000)   return sym + Math.round(n / 1000) + "k" + suffix
+        if (n >= 1000)    return sym + (n / 1000).toFixed(1) + "k" + suffix
+        return sym + Math.round(n) + suffix
+    }
+
     function formatTier(tier) {
         if (tier.indexOf("max_20x") >= 0) return "Max 20x"
         if (tier.indexOf("max_5x") >= 0) return "Max 5x"
@@ -412,14 +426,18 @@ PluginComponent {
 
             // Today's work-spend trailer. Gated by the showWorkCostPill
             // setting (default off). When enabled, intentionally shows
-            // $0.00 on quiet days — the toggle is the user's signal that
-            // they want the tracker visible regardless of value.
+            // $0 on quiet days — the toggle is the user's signal that
+            // they want the tracker visible regardless of value. The
+            // leftPadding/rightPadding gives the dollar text breathing
+            // room from the adjacent ring instead of butting against it.
             StyledText {
                 visible: root.showWorkCostPill
-                text: root.formatCost(root.workTodayCost)
+                text: root.formatCostCompact(root.workTodayCost)
                 font.pixelSize: Theme.fontSizeSmall
                 color: Theme.surfaceVariantText
                 anchors.verticalCenter: parent.verticalCenter
+                leftPadding: Theme.spacingS
+                rightPadding: Theme.spacingS
             }
         }
     }
@@ -440,12 +458,18 @@ PluginComponent {
                 label: root.sevenDayCompact || "7d"
             }
 
+            // topPadding/bottomPadding give the dollar text vertical
+            // breathing room on the vertical bar where the trailer sits
+            // directly beneath the 7d ring. spacingS adds ~4px of
+            // dead space top and bottom on top of the Column spacing.
             StyledText {
                 visible: root.showWorkCostPill
-                text: root.formatCost(root.workTodayCost)
+                text: root.formatCostCompact(root.workTodayCost)
                 font.pixelSize: Theme.fontSizeSmall
                 color: Theme.surfaceVariantText
                 anchors.horizontalCenter: parent.horizontalCenter
+                topPadding: Theme.spacingS
+                bottomPadding: Theme.spacingS
             }
         }
     }

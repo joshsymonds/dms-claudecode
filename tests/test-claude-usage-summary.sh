@@ -30,6 +30,14 @@ make_jsonl_line() {
         "$date" "$model" "$inp" "$out" "$cr" "$cw"
 }
 
+# Same as make_jsonl_line but includes message.id so the dedup branch
+# in claude-usage-summary's awk pipeline activates.
+make_jsonl_line_with_id() {
+    local date="$1" model="$2" inp="$3" out="$4" cr="$5" cw="$6" msg_id="$7"
+    printf '{"type":"assistant","timestamp":"%sT12:00:00Z","sessionId":"sess-1","message":{"id":"%s","model":"%s","usage":{"input_tokens":%d,"output_tokens":%d,"cache_read_input_tokens":%d,"cache_creation_input_tokens":%d}}}\n' \
+        "$date" "$msg_id" "$model" "$inp" "$out" "$cr" "$cw"
+}
+
 setup_env() {
     local name="$1"
     local dir="$TMPDIR_ROOT/$name"
@@ -174,6 +182,126 @@ make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 1000 500 200 100 > "$JSONL"
 OUT8="$TMPDIR_ROOT/test8.json"
 run_script "$ENV8" personal "$OUT8"
 assert_eq "$(jq -r .today_tokens "$OUT8")" "1800" "symlinked projects dir is traversed"
+
+# ============================================================
+echo "=== Test 9: missing pricing-cache → refresh attempted, failure tolerated ==="
+# ============================================================
+# Verifies the bootstrap branch on hosts that never run get-claude-usage
+# (ultraviolet, vermissian). curl is mocked to fail; the script must
+# still produce a valid summary with cost=0 — never abort.
+ENV9=$(setup_env "test9")
+[ -f "$ENV9/.claude/pricing-cache.json" ] && rm "$ENV9/.claude/pricing-cache.json"
+JSONL="$ENV9/.claude/projects/test-project/sess-1.jsonl"
+make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 1000 500 200 100 > "$JSONL"
+OUT9="$TMPDIR_ROOT/test9.json"
+# Mock curl that always fails — simulates no network on a fresh host
+mkdir -p "$TMPDIR_ROOT/bin9"
+cat > "$TMPDIR_ROOT/bin9/curl" << 'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$TMPDIR_ROOT/bin9/curl"
+HOME="$ENV9" PATH="$TMPDIR_ROOT/bin9:$PATH" bash "$SCRIPT" --profile personal --out "$OUT9"
+assert_eq "$(jq -r .today_tokens "$OUT9")" "1800" "tokens still summed when refresh fails"
+assert_eq "$(jq -r .today_cost_usd "$OUT9")" "0.0000" "cost is 0 when refresh fails and no cache"
+
+# ============================================================
+echo "=== Test 10: missing pricing-cache → refresh creates the file ==="
+# ============================================================
+ENV10=$(setup_env "test10")
+[ -f "$ENV10/.claude/pricing-cache.json" ] && rm "$ENV10/.claude/pricing-cache.json"
+JSONL="$ENV10/.claude/projects/test-project/sess-1.jsonl"
+make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 1000 500 200 100 > "$JSONL"
+OUT10="$TMPDIR_ROOT/test10.json"
+# Mock curl that returns a usable LiteLLM-shaped response on the LiteLLM URL
+mkdir -p "$TMPDIR_ROOT/bin10"
+cat > "$TMPDIR_ROOT/bin10/curl" << 'EOF'
+#!/usr/bin/env bash
+# Inspect args to decide which response to emit
+for a in "$@"; do
+    case "$a" in
+        *raw.githubusercontent.com*litellm*)
+            echo '{"claude-opus-4-7":{"input_cost_per_token":1.5e-05,"output_cost_per_token":7.5e-05,"cache_read_input_token_cost":1.5e-06,"cache_creation_input_token_cost":1.875e-05}}'
+            exit 0
+            ;;
+        *frankfurter*)
+            echo '{"rates":{"EUR":0.92}}'
+            exit 0
+            ;;
+    esac
+done
+exit 1
+EOF
+chmod +x "$TMPDIR_ROOT/bin10/curl"
+HOME="$ENV10" PATH="$TMPDIR_ROOT/bin10:$PATH" bash "$SCRIPT" --profile personal --out "$OUT10"
+if [ -f "$ENV10/.claude/pricing-cache.json" ]; then
+    pass "refresh created pricing-cache.json"
+    OPUS_INPUT=$(jq -r '.models.opus.input // empty' "$ENV10/.claude/pricing-cache.json")
+    assert_eq "$OPUS_INPUT" "0.000015" "pricing-cache.json contains expected opus pricing"
+else
+    fail "refresh did not create pricing-cache.json"
+fi
+# Cost should now be non-zero because refresh succeeded:
+# 1000*1.5e-5 + 500*7.5e-5 + 200*1.5e-6 + 100*1.875e-5 = 0.054675 → 0.0547
+assert_eq "$(jq -r .today_cost_usd "$OUT10")" "0.0547" "cost computed from refreshed pricing"
+
+# ============================================================
+echo "=== Test 11: duplicate message_id rows are deduplicated ==="
+# ============================================================
+# Claude Code emits multiple assistant JSONL rows per single API call
+# (streaming chunks + final), all carrying the same message.id with the
+# same cumulative usage. Counting them all overstates cost ~2x. Verify
+# we keep only one occurrence per id.
+ENV11=$(setup_env "test11")
+cat > "$ENV11/.claude/pricing-cache.json" << 'EOF'
+{
+  "updated": "2026-05-23",
+  "models": {
+    "opus": {"input": 1.5e-05, "output": 7.5e-05, "cache_read": 1.5e-06, "cache_write": 1.875e-05}
+  }
+}
+EOF
+JSONL="$ENV11/.claude/projects/test-project/sess-1.jsonl"
+# Three rows with the same message.id, simulating streaming-chunk
+# duplicates. Cumulative usage on each is identical.
+make_jsonl_line_with_id "$TODAY" "claude-opus-4-7-20260101" 1000 500 200 100 "msg_DUP" > "$JSONL"
+make_jsonl_line_with_id "$TODAY" "claude-opus-4-7-20260101" 1000 500 200 100 "msg_DUP" >> "$JSONL"
+make_jsonl_line_with_id "$TODAY" "claude-opus-4-7-20260101" 1000 500 200 100 "msg_DUP" >> "$JSONL"
+# A second message_id, single occurrence — should be counted normally.
+make_jsonl_line_with_id "$TODAY" "claude-opus-4-7-20260101" 500 250 100 50 "msg_UNIQUE" >> "$JSONL"
+OUT11="$TMPDIR_ROOT/test11.json"
+run_script "$ENV11" personal "$OUT11"
+# Expected token total = (1000+500+200+100) + (500+250+100+50) = 1800 + 900 = 2700
+assert_eq "$(jq -r .today_tokens "$OUT11")" "2700" "today_tokens deduped (3 dup rows + 1 unique)"
+# Expected cost = (1000*1.5e-5 + 500*7.5e-5 + 200*1.5e-6 + 100*1.875e-5)
+#               + (500*1.5e-5 + 250*7.5e-5 + 100*1.5e-6 + 50*1.875e-5)
+#               = 0.054675 + 0.0273375 = 0.0820125 → %.4f → 0.0820
+assert_eq "$(jq -r .today_cost_usd "$OUT11")" "0.0820" "today_cost_usd deduped"
+
+# ============================================================
+echo "=== Test 12: rows without message.id are not deduped ==="
+# ============================================================
+# "no-id" fallback: legacy fixtures and very-old records lack
+# message.id. Treat each as unique to avoid collapsing legitimately
+# separate calls together.
+ENV12=$(setup_env "test12")
+cat > "$ENV12/.claude/pricing-cache.json" << 'EOF'
+{
+  "updated": "2026-05-23",
+  "models": {
+    "opus": {"input": 1.5e-05, "output": 7.5e-05, "cache_read": 1.5e-06, "cache_write": 1.875e-05}
+  }
+}
+EOF
+JSONL="$ENV12/.claude/projects/test-project/sess-1.jsonl"
+# Three rows WITHOUT message.id — all three should count.
+make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 1000 500 200 100 > "$JSONL"
+make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 1000 500 200 100 >> "$JSONL"
+make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 1000 500 200 100 >> "$JSONL"
+OUT12="$TMPDIR_ROOT/test12.json"
+run_script "$ENV12" personal "$OUT12"
+# Expected: 3 * (1000+500+200+100) = 5400
+assert_eq "$(jq -r .today_tokens "$OUT12")" "5400" "today_tokens NOT deduped without message.id"
 
 # ============================================================
 echo "=========================================="
