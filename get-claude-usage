@@ -45,6 +45,13 @@ WEEK_COST="0.00"
 MONTH_COST="0.00"
 DAILY_COSTS="0,0,0,0,0,0,0"
 
+# Work-profile costs aggregated across all hosts' work/summary.json files.
+# Unlike personal totals, these are not augmented by the local JSONL pass —
+# the per-host summaries are the sole source of truth.
+WORK_TODAY_COST="0.00"
+WORK_WEEK_COST="0.00"
+WORK_MONTH_COST="0.00"
+
 ALLTIME_SESSIONS=0
 ALLTIME_MESSAGES=0
 FIRST_SESSION="unknown"
@@ -355,6 +362,21 @@ if [ -d "$CLAUDE_SUMMARIES_DIR" ]; then
     if [ -n "$BREAK_RAW" ]; then
         HOST_BREAKDOWN=$(echo "$BREAK_RAW" | sort -rn | awk '{printf "%s%s:%d", (NR==1?"":","), $2, $1}')
     fi
+
+    # --- Work-profile cost aggregation ---
+    # Sums today/week/month_cost_usd from every host's work/summary.json,
+    # INCLUDING the local host. No local-JSONL pass exists for work, so
+    # the work summaries are authoritative — no double-count to avoid.
+    # A missing or malformed file contributes 0 and never aborts the loop.
+    for sum in "$CLAUDE_SUMMARIES_DIR"/*/work/summary.json; do
+        [ -f "$sum" ] || continue
+        s_today_cost=$(jq -r '.today_cost_usd // 0' "$sum" 2>/dev/null || echo 0)
+        s_week_cost=$(jq -r  '.week_cost_usd // 0'  "$sum" 2>/dev/null || echo 0)
+        s_month_cost=$(jq -r '.month_cost_usd // 0' "$sum" 2>/dev/null || echo 0)
+        WORK_TODAY_COST=$(awk -v a="$WORK_TODAY_COST" -v b="$s_today_cost" 'BEGIN{printf "%.2f", a + b}')
+        WORK_WEEK_COST=$(awk  -v a="$WORK_WEEK_COST"  -v b="$s_week_cost"  'BEGIN{printf "%.2f", a + b}')
+        WORK_MONTH_COST=$(awk -v a="$WORK_MONTH_COST" -v b="$s_month_cost" 'BEGIN{printf "%.2f", a + b}')
+    done
 fi
 
 # --- 7-day projection (extrapolate utilization to reset) ---
@@ -416,6 +438,9 @@ echo "MONTH_TOKENS=${MONTH_TOKENS}"
 echo "TODAY_COST=${TODAY_COST}"
 echo "WEEK_COST=${WEEK_COST}"
 echo "MONTH_COST=${MONTH_COST}"
+echo "WORK_TODAY_COST=${WORK_TODAY_COST}"
+echo "WORK_WEEK_COST=${WORK_WEEK_COST}"
+echo "WORK_MONTH_COST=${WORK_MONTH_COST}"
 echo "DAILY_COSTS=${DAILY_COSTS}"
 echo "USD_EUR_RATE=${USD_EUR_RATE}"
 echo "HOST_BREAKDOWN=${HOST_BREAKDOWN}"
