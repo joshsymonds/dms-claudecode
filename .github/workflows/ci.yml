@@ -13,7 +13,7 @@ jobs:
         uses: ludeeus/action-shellcheck@2.0.0
         with:
           scandir: .
-          additional_files: get-claude-usage
+          additional_files: get-claude-usage claude-usage-summary
 
   tests:
     runs-on: ubuntu-latest

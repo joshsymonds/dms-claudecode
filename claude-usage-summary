@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# Per-host, per-profile transcript summarizer for Claude Code.
+#
+# Reads $HOME/.claude{,-work}/projects/**/*.jsonl, computes today/week
+# token + cost totals plus per-model breakdown, writes a single small
+# JSON file. Designed to run on a 10-minute systemd user timer; one
+# invocation per profile.
+#
+# The output is consumed by `get-claude-usage` running on the bar host
+# (gnomon): it aggregates the summary.json from every host's NFS bucket
+# instead of crawling all the JSONL files itself. That keeps the
+# Synology platter drives quiet during widget polling.
+#
+# Schema:
+#   {
+#     "host": "ultraviolet",
+#     "profile": "personal",
+#     "generated_at": "ISO-8601",
+#     "today_tokens": int,
+#     "today_cost_usd": float,
+#     "today_per_model": { family: tokens, ... },
+#     "week_tokens": int,
+#     "week_cost_usd": float,
+#     "week_per_model": { family: tokens, ... },
+#     "daily_tokens": [Mon..Sun]   # calendar week
+#     "daily_costs":  [Mon..Sun]
+#   }
+#
+# No `set -o pipefail` on the big find|jq|awk pipeline — partial-file
+# tolerance matches the get-claude-usage convention.
+set -eu
+
+PROFILE=""
+OUT=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --profile) PROFILE="${2:-}"; shift 2 ;;
+        --out)     OUT="${2:-}";     shift 2 ;;
+        -h|--help)
+            sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *) echo "claude-usage-summary: unknown arg: $1" >&2; exit 2 ;;
+    esac
+done
+
+[ -n "$PROFILE" ] || { echo "claude-usage-summary: --profile required" >&2; exit 2; }
+[ -n "$OUT" ]     || { echo "claude-usage-summary: --out required" >&2; exit 2; }
+
+case "$PROFILE" in
+    personal) PROFILE_DIR="$HOME/.claude" ;;
+    work)     PROFILE_DIR="$HOME/.claude-work" ;;
+    *) echo "claude-usage-summary: unknown profile '$PROFILE' (expected personal|work)" >&2; exit 2 ;;
+esac
+
+PROJECTS="$PROFILE_DIR/projects"
+PRICING_CACHE="$HOME/.claude/pricing-cache.json"
+
+HOSTNAME_NOW="$(uname -n)"
+TODAY=$(date +%Y-%m-%d)
+DOW=$(date +%u)  # 1=Mon..7=Sun
+WEEK_START=$(date -d "$((DOW - 1)) days ago" +%Y-%m-%d)
+GENERATED="$(date -Iseconds)"
+
+# Awk-friendly pricing string: "opus:input:output:cache_read:cache_write,sonnet:...,haiku:..."
+# Personal-profile pricing-cache.json is reused across profiles — pricing is
+# global, not per-profile. If unavailable, costs come out as zero and the
+# bar shows token totals only.
+PRICING_AWK=""
+if [ -f "$PRICING_CACHE" ]; then
+    PRICING_AWK=$(jq -r '
+        [.models | to_entries[]
+         | "\(.key):\(.value.input):\(.value.output):\(.value.cache_read):\(.value.cache_write)"]
+        | join(",")' "$PRICING_CACHE" 2>/dev/null || echo "")
+fi
+
+emit_zero() {
+    mkdir -p "$(dirname "$OUT")"
+    jq -n --arg host "$HOSTNAME_NOW" --arg profile "$PROFILE" --arg generated "$GENERATED" \
+        '{host: $host, profile: $profile, generated_at: $generated,
+          today_tokens: 0, today_cost_usd: 0, today_per_model: {},
+          week_tokens: 0,  week_cost_usd: 0,  week_per_model: {},
+          daily_tokens: [0,0,0,0,0,0,0], daily_costs: [0,0,0,0,0,0,0]}' \
+        > "$OUT.tmp" && mv "$OUT.tmp" "$OUT"
+}
+
+if [ ! -d "$PROJECTS" ]; then
+    emit_zero
+    exit 0
+fi
+
+# Calendar-week dates Mon..Sun, comma-separated for awk.
+DAY_DATES=""
+for i in 0 1 2 3 4 5 6; do
+    d=$(date -d "$WEEK_START + ${i} days" +%Y-%m-%d)
+    DAY_DATES="${DAY_DATES:+${DAY_DATES},}${d}"
+done
+
+# Single pass: extract granular tokens per assistant message, aggregate
+# with awk. JSON encoding is built up by awk (no second jq round-trip).
+# `find -H` follows the start path if it's a symlink (PROJECTS is
+# typically ~/.claude/projects -> /mnt/claude/$HOST/personal/projects)
+# but does NOT follow symlinks encountered during traversal — avoids
+# the classic "find returns nothing because PROJECTS is a symlink" trap.
+RESULT=$(find -H "$PROJECTS" -name '*.jsonl' -mtime -31 -exec cat {} + 2>/dev/null \
+    | jq -r -R 'fromjson?
+        | select(.type == "assistant")
+        | "\(.timestamp[:10]) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0)"' \
+    | awk -v today="$TODAY" -v week_start="$WEEK_START" -v day_dates="$DAY_DATES" -v pricing="$PRICING_AWK" '
+BEGIN {
+    split(day_dates, dates, ",")
+    has_pricing = 0
+    if (pricing != "") {
+        n = split(pricing, pmodels, ",")
+        for (i = 1; i <= n; i++) {
+            split(pmodels[i], pp, ":")
+            price_in[pp[1]] = pp[2] + 0
+            price_out[pp[1]] = pp[3] + 0
+            price_cr[pp[1]] = pp[4] + 0
+            price_cw[pp[1]] = pp[5] + 0
+        }
+        has_pricing = 1
+    }
+}
+{
+    date = $1; model = $2
+    inp = $3 + 0; out = $4 + 0; cr = $5 + 0; cw = $6 + 0
+    total = inp + out + cr + cw
+
+    # Extract family from model name (claude-{family}-{version...})
+    n_parts = split(model, mparts, "-")
+    family = (n_parts >= 3 && mparts[1] == "claude") ? mparts[2] : model
+
+    day_tokens[date] += total
+    if (date == today) {
+        today_tokens += total
+        today_model[family] += total
+    }
+    if (date >= week_start) {
+        week_tokens += total
+        week_model[family] += total
+    }
+
+    if (has_pricing && (family in price_in)) {
+        cost = inp * price_in[family] + out * price_out[family] + cr * price_cr[family] + cw * price_cw[family]
+        day_cost[date] += cost
+        if (date == today)      today_cost += cost
+        if (date >= week_start) week_cost  += cost
+    }
+}
+END {
+    # Mon..Sun arrays
+    daily_t = ""; daily_c = ""
+    for (i = 1; i <= 7; i++) {
+        val_t = (dates[i] in day_tokens) ? day_tokens[dates[i]] : 0
+        val_c = (dates[i] in day_cost)   ? day_cost[dates[i]]   : 0
+        daily_t = daily_t (i > 1 ? "," : "") val_t + 0
+        daily_c = daily_c (i > 1 ? "," : "") sprintf("%.4f", val_c)
+    }
+
+    # Per-model JSON objects
+    tm = "{"; first = 1
+    for (m in today_model) {
+        tm = tm (first ? "" : ",") "\"" m "\":" today_model[m] + 0
+        first = 0
+    }
+    tm = tm "}"
+
+    wm = "{"; first = 1
+    for (m in week_model) {
+        wm = wm (first ? "" : ",") "\"" m "\":" week_model[m] + 0
+        first = 0
+    }
+    wm = wm "}"
+
+    # Tab-separated scalars + JSON fragments
+    printf "%d\t%.4f\t%d\t%.4f\t[%s]\t[%s]\t%s\t%s\n", \
+        today_tokens + 0, today_cost + 0, week_tokens + 0, week_cost + 0, \
+        daily_t, daily_c, tm, wm
+}')
+
+# Empty pipeline = no assistant messages found. Emit zero summary so the
+# downstream aggregator always sees a valid file.
+if [ -z "$RESULT" ]; then
+    emit_zero
+    exit 0
+fi
+
+IFS=$'\t' read -r TODAY_TOK TODAY_COST WEEK_TOK WEEK_COST DAILY_TOK DAILY_COST TODAY_PM WEEK_PM <<<"$RESULT"
+
+mkdir -p "$(dirname "$OUT")"
+jq -n \
+    --arg host "$HOSTNAME_NOW" \
+    --arg profile "$PROFILE" \
+    --arg generated "$GENERATED" \
+    --argjson today_tokens "$TODAY_TOK" \
+    --argjson today_cost "$TODAY_COST" \
+    --argjson week_tokens "$WEEK_TOK" \
+    --argjson week_cost "$WEEK_COST" \
+    --argjson daily_tokens "$DAILY_TOK" \
+    --argjson daily_costs "$DAILY_COST" \
+    --argjson today_per_model "$TODAY_PM" \
+    --argjson week_per_model "$WEEK_PM" \
+    '{host: $host, profile: $profile, generated_at: $generated,
+      today_tokens: $today_tokens, today_cost_usd: $today_cost,
+      today_per_model: $today_per_model,
+      week_tokens: $week_tokens, week_cost_usd: $week_cost,
+      week_per_model: $week_per_model,
+      daily_tokens: $daily_tokens, daily_costs: $daily_costs}' \
+    > "$OUT.tmp" && mv "$OUT.tmp" "$OUT"
