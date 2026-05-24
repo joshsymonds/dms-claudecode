@@ -421,9 +421,20 @@ PluginComponent {
 
     popoutContent: Component {
         PopoutComponent {
+            id: popoutRoot
             headerText: root.tr("Claude Code Usage")
             detailsText: root.rateLimitTier ? root.tr("Subscription") + " : " + root.formatTier(root.rateLimitTier) : ""
             showCloseButton: true
+
+            // Explicit implicitHeight bypasses Qt's Column-positioner
+            // auto-cascade, which intermittently captures a stale/partial
+            // value at the moment PluginPopout.onLoaded fires its
+            // Qt.binding(() => item.implicitHeight + ...). Driving from
+            // cardsCol.implicitHeight (which is a deterministic sum of
+            // explicit card heights) plus the PopoutComponent's own
+            // header/details chrome makes every open render at the right
+            // height on the first frame.
+            implicitHeight: cardsCol.implicitHeight + headerHeight + detailsHeight + Theme.spacingL * 2
 
             // Inner cards Column. Uses x/width positioning instead of
             // anchors.horizontalCenter because the parent PopoutComponent
@@ -431,6 +442,7 @@ PluginComponent {
             // makes Qt drop this child from the parent's implicitHeight
             // computation, which would break the auto-sizing path.
             Column {
+                id: cardsCol
                 width: parent.width - Theme.spacingM * 2
                 x: Theme.spacingM
                 spacing: Theme.spacingL
