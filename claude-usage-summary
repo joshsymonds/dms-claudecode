@@ -157,15 +157,34 @@ done
 # the classic "find returns nothing because PROJECTS is a symlink" trap.
 RESULT=$(find -H "$PROJECTS" -name '*.jsonl' -mtime -31 -exec cat {} + 2>/dev/null \
     | jq -r -R 'fromjson?
-        | select(.type == "assistant")
+        # Canonical filter set, ported from ccusage v15.0.0 src/data-loader.ts:
+        #   - .type == "assistant" (only billed responses; user/system/etc. are free)
+        #   - .isSidechain != true   (subagent re-logs of the parent conversation
+        #                             have separate cache_read accounting but
+        #                             Claude Code-specific overcounts in known
+        #                             ccusage issue #913)
+        #   - .message.model != "<synthetic>" (placeholder/error rows with full
+        #                                      token counts but no actual API call)
+        #   - .message.usage present (records without usage are not billed)
+        | select(.type == "assistant"
+                 and (.isSidechain // false) == false
+                 and (.message.model // "") != "<synthetic>"
+                 and (.message.usage // null) != null)
         # Emit LOCAL date (TZ of the machine running this script), not the
         # UTC prefix of the timestamp. Anthropic/Bedrock JSONL timestamps
         # are UTC; comparing their date prefix against bash $TODAY (which
         # is local-tz) mis-classified ~7h of late-local-yesterday activity
-        # as "today" for PDT users — ~3x inflation of "today" totals when
-        # the timer fires in late local-afternoon. fromdateiso8601 needs
-        # the milliseconds stripped, hence the [:19] + "Z" trim.
-        | "\(((.timestamp[:19]) + "Z") | fromdateiso8601 | localtime | strftime("%Y-%m-%d")) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0) \(.sessionId // "unknown") \(.message.id // "no-id")"' \
+        # as "today" for PDT users. fromdateiso8601 needs the milliseconds
+        # stripped, hence the [:19] + "Z" trim.
+        #
+        # Dedup key is `message.id:requestId`, also ported from ccusage
+        # (issue #389): Claude Code emits the SAME message.id twice per
+        # assistant turn (once for the text part and once for the
+        # tool_use part) with identical usage blocks. Both carry the
+        # same requestId, so this joint key collapses them. The "no-id"
+        # / "no-req" fallbacks are kept distinct so legacy fixtures
+        # without these fields are not all collapsed into one row.
+        | "\(((.timestamp[:19]) + "Z") | fromdateiso8601 | localtime | strftime("%Y-%m-%d")) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0) \(.sessionId // "unknown") \(.message.id // "no-id"):\(.requestId // "no-req")"' \
     | awk -v today="$TODAY" -v week_start="$WEEK_START" -v month_start="$MONTH_START" -v day_dates="$DAY_DATES" -v pricing="$PRICING_AWK" '
 BEGIN {
     split(day_dates, dates, ",")
@@ -185,19 +204,19 @@ BEGIN {
 {
     date = $1; model = $2
     inp = $3 + 0; out = $4 + 0; cr = $5 + 0; cw = $6 + 0
-    sess = $7; msg_id = $8
+    sess = $7; dedup_key = $8
 
-    # Dedup by message_id. Claude Code emits multiple "assistant" JSONL
-    # records per single API call (intermediate streaming chunks + final
-    # message), each carrying the SAME message.id and the SAME
-    # cumulative usage block. Counting them all roughly doubled
-    # cache_read totals and overstated cost ~2x vs the actual Bedrock
-    # bill. message.id is missing on pre-cache-tracking fixtures and
-    # very old records — treat "no-id" as unique to avoid collapsing
-    # legitimately separate calls together.
-    if (msg_id != "no-id") {
-        if (msg_id in seen_msg) next
-        seen_msg[msg_id] = 1
+    # Dedup by composite (message.id, requestId) key, matching the
+    # canonical hash ccusage uses (its issue #389). Claude Code emits
+    # the SAME message.id twice per assistant turn (text part +
+    # tool_use part) with identical usage. Both rows carry the same
+    # requestId, so the joint key collapses them. Records without
+    # either field land on the "no-id:no-req" or "msg-X:no-req" key,
+    # and we let those rows through (no dedup) so legacy fixtures are
+    # not all collapsed together.
+    if (dedup_key != "no-id:no-req") {
+        if (dedup_key in seen_msg) next
+        seen_msg[dedup_key] = 1
     }
     total = inp + out + cr + cw
 
