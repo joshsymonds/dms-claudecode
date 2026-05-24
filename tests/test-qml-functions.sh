@@ -129,6 +129,9 @@ function parseLine(line, state) {
     case "TODAY_COST": state.todayCost = parseFloat(val) || 0; break
     case "WEEK_COST": state.weekCost = parseFloat(val) || 0; break
     case "MONTH_COST": state.monthCost = parseFloat(val) || 0; break
+    case "WORK_TODAY_COST": state.workTodayCost = parseFloat(val) || 0; break
+    case "WORK_WEEK_COST": state.workWeekCost = parseFloat(val) || 0; break
+    case "WORK_MONTH_COST": state.workMonthCost = parseFloat(val) || 0; break
     case "USD_EUR_RATE": state.usdEurRate = parseFloat(val) || 0; break
     case "DAILY_COSTS":
         var cparts = val.split(",")
@@ -354,6 +357,14 @@ test_parse_line "EXTRA_USAGE_ENABLED=false" "extraUsageEnabled" 'false' "parseLi
 # Empty values default to 0
 test_parse_line "WEEK_TOKENS=" "weekTokens" '0' "parseLine empty value defaults to 0"
 test_parse_line "FIVE_HOUR_UTIL=" "fiveHourUtil" '0' "parseLine empty float defaults to 0"
+
+# Work-cost properties
+test_parse_line "WORK_TODAY_COST=3.75" "workTodayCost" '3.75' "parseLine WORK_TODAY_COST float"
+test_parse_line "WORK_WEEK_COST=24.25" "workWeekCost" '24.25' "parseLine WORK_WEEK_COST float"
+test_parse_line "WORK_MONTH_COST=110.00" "workMonthCost" '110' "parseLine WORK_MONTH_COST float"
+test_parse_line "WORK_TODAY_COST=0.00" "workTodayCost" '0' "parseLine WORK_TODAY_COST zero"
+test_parse_line "WORK_WEEK_COST=" "workWeekCost" '0' "parseLine WORK_WEEK_COST empty defaults to 0"
+test_parse_line "WORK_MONTH_COST=garbage" "workMonthCost" '0' "parseLine WORK_MONTH_COST non-numeric defaults to 0"
 
 # No equals sign — ignored
 RESULT_NOEQUALS=$(run_js "${JS_HARNESS}

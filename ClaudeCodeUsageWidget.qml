@@ -66,6 +66,12 @@ PluginComponent {
     property real todayCost: 0
     property real weekCost: 0
     property real monthCost: 0
+
+    // Work-profile costs aggregated across all hosts' work/summary.json
+    // by get-claude-usage. Always present (zero when no work data).
+    property real workTodayCost: 0
+    property real workWeekCost: 0
+    property real workMonthCost: 0
     property var dailyCosts: [0, 0, 0, 0, 0, 0, 0]
     property real usdEurRate: 0
 
@@ -259,6 +265,9 @@ PluginComponent {
         case "TODAY_COST": todayCost = parseFloat(val) || 0; break
         case "WEEK_COST": weekCost = parseFloat(val) || 0; break
         case "MONTH_COST": monthCost = parseFloat(val) || 0; break
+        case "WORK_TODAY_COST": workTodayCost = parseFloat(val) || 0; break
+        case "WORK_WEEK_COST": workWeekCost = parseFloat(val) || 0; break
+        case "WORK_MONTH_COST": workMonthCost = parseFloat(val) || 0; break
         case "USD_EUR_RATE": usdEurRate = parseFloat(val) || 0; break
         case "DAILY_COSTS":
             var cparts = val.split(",")
