@@ -131,7 +131,10 @@ PluginComponent {
     property string scriptPath: PluginService.pluginDirectory + "/claudeCodeUsage/get-claude-usage"
 
     popoutWidth: 380
-    popoutHeight: 660
+    // 660 was sized for the pre-projection layout. The projection card
+    // (~80px) + per-host breakdown row (~24px when present) push the
+    // bottom card off-screen at 660, so bump to 770.
+    popoutHeight: 770
 
     // --- Helpers ---
 
