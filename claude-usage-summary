@@ -158,7 +158,14 @@ done
 RESULT=$(find -H "$PROJECTS" -name '*.jsonl' -mtime -31 -exec cat {} + 2>/dev/null \
     | jq -r -R 'fromjson?
         | select(.type == "assistant")
-        | "\(.timestamp[:10]) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0) \(.sessionId // "unknown") \(.message.id // "no-id")"' \
+        # Emit LOCAL date (TZ of the machine running this script), not the
+        # UTC prefix of the timestamp. Anthropic/Bedrock JSONL timestamps
+        # are UTC; comparing their date prefix against bash $TODAY (which
+        # is local-tz) mis-classified ~7h of late-local-yesterday activity
+        # as "today" for PDT users — ~3x inflation of "today" totals when
+        # the timer fires in late local-afternoon. fromdateiso8601 needs
+        # the milliseconds stripped, hence the [:19] + "Z" trim.
+        | "\(((.timestamp[:19]) + "Z") | fromdateiso8601 | localtime | strftime("%Y-%m-%d")) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0) \(.sessionId // "unknown") \(.message.id // "no-id")"' \
     | awk -v today="$TODAY" -v week_start="$WEEK_START" -v month_start="$MONTH_START" -v day_dates="$DAY_DATES" -v pricing="$PRICING_AWK" '
 BEGIN {
     split(day_dates, dates, ",")

@@ -304,6 +304,29 @@ run_script "$ENV12" personal "$OUT12"
 assert_eq "$(jq -r .today_tokens "$OUT12")" "5400" "today_tokens NOT deduped without message.id"
 
 # ============================================================
+echo "=== Test 13: UTC timestamps map to LOCAL day, not UTC date prefix ==="
+# ============================================================
+# Bedrock/Anthropic JSONLs record timestamps in UTC; bash's $TODAY is
+# the local-tz date. Comparing UTC-prefix == local-today inflated
+# today_tokens with late-yesterday-local activity. Verify that a
+# timestamp from yesterday-local (regardless of its UTC date) is NOT
+# counted in today_tokens, and one from today-local IS.
+ENV13=$(setup_env "test13")
+# Pivot off today's local midnight as a unix epoch so we don't have to
+# wrestle with `date -d`'s relative-time grammar.
+LOCAL_MIDNIGHT_EPOCH=$(date -d "today 00:00:00" +%s)
+# 30 min before today's local midnight = late yesterday-local
+YESTERDAY_TS=$(date -u -d "@$((LOCAL_MIDNIGHT_EPOCH - 1800))" +"%Y-%m-%dT%H:%M:%S.000Z")
+# 30 min after today's local midnight = early today-local
+TODAY_TS=$(date -u -d "@$((LOCAL_MIDNIGHT_EPOCH + 1800))" +"%Y-%m-%dT%H:%M:%S.000Z")
+JSONL="$ENV13/.claude/projects/test-project/sess-1.jsonl"
+printf '{"type":"assistant","timestamp":"%s","sessionId":"sess","message":{"id":"msg-y","model":"claude-opus-4-7-20260101","usage":{"input_tokens":100,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n' "$YESTERDAY_TS" > "$JSONL"
+printf '{"type":"assistant","timestamp":"%s","sessionId":"sess","message":{"id":"msg-t","model":"claude-opus-4-7-20260101","usage":{"input_tokens":200,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n' "$TODAY_TS" >> "$JSONL"
+OUT13="$TMPDIR_ROOT/test13.json"
+run_script "$ENV13" personal "$OUT13"
+assert_eq "$(jq -r .today_tokens "$OUT13")" "200" "today_tokens excludes yesterday-local UTC-late timestamps"
+
+# ============================================================
 echo "=========================================="
 echo "RESULTS: $PASS passed, $FAIL failed"
 echo "=========================================="
