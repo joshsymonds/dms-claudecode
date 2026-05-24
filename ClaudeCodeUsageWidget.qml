@@ -773,6 +773,93 @@ PluginComponent {
                     }
                 }
 
+                // --- Work Spend card ---
+                // Aggregates today/week/month dollar cost from every host's
+                // work/summary.json (~/Work/attain cwd-classified projects).
+                // Month is highlighted because that's the billing-cycle
+                // signal; Today/Week are reference.
+                StyledRect {
+                    width: parent.width
+                    height: workSpendCol.implicitHeight + Theme.spacingM * 2
+                    color: Theme.surfaceContainerHigh
+                    visible: root.workTodayCost > 0 || root.workWeekCost > 0 || root.workMonthCost > 0
+
+                    Column {
+                        id: workSpendCol
+                        anchors.fill: parent
+                        anchors.margins: Theme.spacingM
+                        spacing: Theme.spacingM
+
+                        StyledText {
+                            text: root.tr("Work Spend")
+                            font.pixelSize: Theme.fontSizeMedium
+                            font.weight: Font.Medium
+                            color: Theme.surfaceText
+                        }
+
+                        Row {
+                            width: parent.width
+
+                            Column {
+                                width: parent.width / 3
+                                spacing: 4
+
+                                StyledText {
+                                    text: root.tr("Today")
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    color: Theme.surfaceVariantText
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                }
+                                StyledText {
+                                    text: root.formatCost(root.workTodayCost)
+                                    font.pixelSize: Theme.fontSizeLarge
+                                    font.weight: Font.DemiBold
+                                    color: Theme.surfaceText
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                }
+                            }
+
+                            Column {
+                                width: parent.width / 3
+                                spacing: 4
+
+                                StyledText {
+                                    text: root.tr("Week")
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    color: Theme.surfaceVariantText
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                }
+                                StyledText {
+                                    text: root.formatCost(root.workWeekCost)
+                                    font.pixelSize: Theme.fontSizeLarge
+                                    font.weight: Font.DemiBold
+                                    color: Theme.surfaceText
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                }
+                            }
+
+                            Column {
+                                width: parent.width / 3
+                                spacing: 4
+
+                                StyledText {
+                                    text: root.tr("Month")
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    color: Theme.surfaceVariantText
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                }
+                                StyledText {
+                                    text: root.formatCost(root.workMonthCost)
+                                    font.pixelSize: Theme.fontSizeLarge
+                                    font.weight: Font.DemiBold
+                                    color: Theme.primary
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // --- Daily activity card ---
                 StyledRect {
                     width: parent.width
