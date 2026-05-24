@@ -22,6 +22,10 @@ PluginComponent {
 
     // Settings
     property int refreshInterval: (pluginData.refreshInterval || 2) * 60000
+    // When true, the bar pill appends today's work-spend dollar amount
+    // after the rings. Showing $0.00 is intentional — the toggle is the
+    // user's signal that they want the tracker live regardless of value.
+    property bool showWorkCostPill: pluginData.showWorkCostPill || false
 
     // API usage data
     property string subscriptionType: ""
@@ -405,6 +409,18 @@ PluginComponent {
                 // Trailing ring is always the 7d window ("3d" or "12h").
                 label: root.sevenDayCompact || "7d"
             }
+
+            // Today's work-spend trailer. Gated by the showWorkCostPill
+            // setting (default off). When enabled, intentionally shows
+            // $0.00 on quiet days — the toggle is the user's signal that
+            // they want the tracker visible regardless of value.
+            StyledText {
+                visible: root.showWorkCostPill
+                text: root.formatCost(root.workTodayCost)
+                font.pixelSize: Theme.fontSizeSmall
+                color: Theme.surfaceVariantText
+                anchors.verticalCenter: parent.verticalCenter
+            }
         }
     }
 
@@ -422,6 +438,14 @@ PluginComponent {
                 anchors.horizontalCenter: parent.horizontalCenter
                 percent: root.sevenDayUtil
                 label: root.sevenDayCompact || "7d"
+            }
+
+            StyledText {
+                visible: root.showWorkCostPill
+                text: root.formatCost(root.workTodayCost)
+                font.pixelSize: Theme.fontSizeSmall
+                color: Theme.surfaceVariantText
+                anchors.horizontalCenter: parent.horizontalCenter
             }
         }
     }

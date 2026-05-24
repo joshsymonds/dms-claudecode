@@ -38,4 +38,11 @@ PluginSettings {
         unit: "min"
         leftIcon: "schedule"
     }
+
+    ToggleSetting {
+        settingKey: "showWorkCostPill"
+        label: root.tr("Show work cost in bar pill")
+        description: root.tr("Append today's Bedrock/API work spend after the rings. Useful for tracking employer-billed token costs.")
+        defaultValue: false
+    }
 }
