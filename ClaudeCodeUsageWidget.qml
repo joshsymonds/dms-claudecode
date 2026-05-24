@@ -132,35 +132,12 @@ PluginComponent {
 
     popoutWidth: 380
 
-    // Dynamic popout height. PluginPopout.qml binds its contentHeight
-    // to the loaded item's implicitHeight on the loader's onLoaded
-    // signal, but the static popoutHeight wins at first paint and the
-    // implicit-sizing path is unreliable when the inner column uses
-    // horizontalCenter anchors. So we compute the height from the
-    // cards we know are visible.
-    //
-    // Per-card sizes are measured: card body + internal margins
-    // (Theme.spacingM * 2) + Theme.spacingL between cards.
-    popoutHeight: {
-        // Reset on every refresh + countdown tick + condition change
-        void(refreshEpoch); void(countdownNow)
-        var spacing = Theme.spacingL
-        var h = Theme.spacingL * 2          // outer popout padding
-        h += 40 + 30                        // header + details ("Subscription: Max 20x")
-        h += 130 + spacing                  // 5h Rate Window card (ring + 3 text lines)
-        h += 130 + spacing                  // 7-Day Usage card
-        if (sevenDayElapsedFrac >= 0.01)
-            h += 90 + spacing               // 7-Day Projection card (visible when in-window)
-        var consumption = 200 + Theme.spacingM * 2
-        if (hostBreakdownList.length >= 2)
-            consumption += 32               // per-host breakdown row
-        h += consumption + spacing          // Token Consumption card
-        h += 220 + spacing                  // Daily activity card (bar chart)
-        if (modelListData.count > 0)
-            h += 130 + spacing              // Models card
-        h += 90 + spacing                   // All-time footer card
-        return h
-    }
+    // Initial popoutHeight is just a first-frame hint. PluginPopout.qml
+    // rebinds contentHeight = Qt.binding(() => item.implicitHeight + ...)
+    // on Loader.onLoaded, so the real popup size tracks the PopoutComponent
+    // Column's implicitHeight. That works as long as the inner cards
+    // Column doesn't use anchors against its Column parent — see below.
+    popoutHeight: 800
 
     // --- Helpers ---
 
@@ -448,9 +425,14 @@ PluginComponent {
             detailsText: root.rateLimitTier ? root.tr("Subscription") + " : " + root.formatTier(root.rateLimitTier) : ""
             showCloseButton: true
 
+            // Inner cards Column. Uses x/width positioning instead of
+            // anchors.horizontalCenter because the parent PopoutComponent
+            // is itself a Column positioner: anchoring inside a positioner
+            // makes Qt drop this child from the parent's implicitHeight
+            // computation, which would break the auto-sizing path.
             Column {
                 width: parent.width - Theme.spacingM * 2
-                anchors.horizontalCenter: parent.horizontalCenter
+                x: Theme.spacingM
                 spacing: Theme.spacingL
 
                 // --- 5h Rate Window card ---
