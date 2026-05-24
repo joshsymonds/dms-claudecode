@@ -21,7 +21,11 @@
 #     "today_per_model": { family: tokens, ... },
 #     "week_tokens": int,
 #     "week_cost_usd": float,
+#     "week_messages": int,
+#     "week_sessions": int,
 #     "week_per_model": { family: tokens, ... },
+#     "month_tokens": int,
+#     "month_cost_usd": float,
 #     "daily_tokens": [Mon..Sun]   # calendar week
 #     "daily_costs":  [Mon..Sun]
 #   }
@@ -61,6 +65,7 @@ HOSTNAME_NOW="$(uname -n)"
 TODAY=$(date +%Y-%m-%d)
 DOW=$(date +%u)  # 1=Mon..7=Sun
 WEEK_START=$(date -d "$((DOW - 1)) days ago" +%Y-%m-%d)
+MONTH_START=$(date +%Y-%m-01)
 GENERATED="$(date -Iseconds)"
 
 # Awk-friendly pricing string: "opus:input:output:cache_read:cache_write,sonnet:...,haiku:..."
@@ -81,6 +86,8 @@ emit_zero() {
         '{host: $host, profile: $profile, generated_at: $generated,
           today_tokens: 0, today_cost_usd: 0, today_per_model: {},
           week_tokens: 0,  week_cost_usd: 0,  week_per_model: {},
+          week_messages: 0, week_sessions: 0,
+          month_tokens: 0, month_cost_usd: 0,
           daily_tokens: [0,0,0,0,0,0,0], daily_costs: [0,0,0,0,0,0,0]}' \
         > "$OUT.tmp" && mv "$OUT.tmp" "$OUT"
 }
@@ -106,8 +113,8 @@ done
 RESULT=$(find -H "$PROJECTS" -name '*.jsonl' -mtime -31 -exec cat {} + 2>/dev/null \
     | jq -r -R 'fromjson?
         | select(.type == "assistant")
-        | "\(.timestamp[:10]) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0)"' \
-    | awk -v today="$TODAY" -v week_start="$WEEK_START" -v day_dates="$DAY_DATES" -v pricing="$PRICING_AWK" '
+        | "\(.timestamp[:10]) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0) \(.sessionId // "unknown")"' \
+    | awk -v today="$TODAY" -v week_start="$WEEK_START" -v month_start="$MONTH_START" -v day_dates="$DAY_DATES" -v pricing="$PRICING_AWK" '
 BEGIN {
     split(day_dates, dates, ",")
     has_pricing = 0
@@ -126,6 +133,7 @@ BEGIN {
 {
     date = $1; model = $2
     inp = $3 + 0; out = $4 + 0; cr = $5 + 0; cw = $6 + 0
+    sess = $7
     total = inp + out + cr + cw
 
     # Extract family from model name (claude-{family}-{version...})
@@ -140,13 +148,17 @@ BEGIN {
     if (date >= week_start) {
         week_tokens += total
         week_model[family] += total
+        week_messages++
+        week_sess[sess] = 1
     }
+    if (date >= month_start) month_tokens += total
 
     if (has_pricing && (family in price_in)) {
         cost = inp * price_in[family] + out * price_out[family] + cr * price_cr[family] + cw * price_cw[family]
         day_cost[date] += cost
-        if (date == today)      today_cost += cost
-        if (date >= week_start) week_cost  += cost
+        if (date == today)       today_cost += cost
+        if (date >= week_start)  week_cost  += cost
+        if (date >= month_start) month_cost += cost
     }
 }
 END {
@@ -174,9 +186,15 @@ END {
     }
     wm = wm "}"
 
+    # Count distinct week sessions
+    n_sess = 0; for (s in week_sess) n_sess++
+
     # Tab-separated scalars + JSON fragments
-    printf "%d\t%.4f\t%d\t%.4f\t[%s]\t[%s]\t%s\t%s\n", \
-        today_tokens + 0, today_cost + 0, week_tokens + 0, week_cost + 0, \
+    printf "%d\t%.4f\t%d\t%.4f\t%d\t%d\t%d\t%.4f\t[%s]\t[%s]\t%s\t%s\n", \
+        today_tokens + 0, today_cost + 0, \
+        week_tokens + 0, week_cost + 0, \
+        week_messages + 0, n_sess + 0, \
+        month_tokens + 0, month_cost + 0, \
         daily_t, daily_c, tm, wm
 }')
 
@@ -187,7 +205,7 @@ if [ -z "$RESULT" ]; then
     exit 0
 fi
 
-IFS=$'\t' read -r TODAY_TOK TODAY_COST WEEK_TOK WEEK_COST DAILY_TOK DAILY_COST TODAY_PM WEEK_PM <<<"$RESULT"
+IFS=$'\t' read -r TODAY_TOK TODAY_COST WEEK_TOK WEEK_COST WEEK_MSGS WEEK_SESS MONTH_TOK MONTH_COST DAILY_TOK DAILY_COST TODAY_PM WEEK_PM <<<"$RESULT"
 
 mkdir -p "$(dirname "$OUT")"
 jq -n \
@@ -198,6 +216,10 @@ jq -n \
     --argjson today_cost "$TODAY_COST" \
     --argjson week_tokens "$WEEK_TOK" \
     --argjson week_cost "$WEEK_COST" \
+    --argjson week_messages "$WEEK_MSGS" \
+    --argjson week_sessions "$WEEK_SESS" \
+    --argjson month_tokens "$MONTH_TOK" \
+    --argjson month_cost "$MONTH_COST" \
     --argjson daily_tokens "$DAILY_TOK" \
     --argjson daily_costs "$DAILY_COST" \
     --argjson today_per_model "$TODAY_PM" \
@@ -206,6 +228,8 @@ jq -n \
       today_tokens: $today_tokens, today_cost_usd: $today_cost,
       today_per_model: $today_per_model,
       week_tokens: $week_tokens, week_cost_usd: $week_cost,
+      week_messages: $week_messages, week_sessions: $week_sessions,
       week_per_model: $week_per_model,
+      month_tokens: $month_tokens, month_cost_usd: $month_cost,
       daily_tokens: $daily_tokens, daily_costs: $daily_costs}' \
     > "$OUT.tmp" && mv "$OUT.tmp" "$OUT"

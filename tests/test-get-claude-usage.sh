@@ -37,8 +37,12 @@ chmod +x "$mock_curl"
 
 run_script() {
     local home_dir="$1"
-    # Override HOME and prepend mock curl to PATH
-    HOME="$home_dir" PATH="$TMPDIR_ROOT:$PATH" bash "$SCRIPT" 2>/dev/null
+    # Override HOME and prepend mock curl to PATH. Also pin
+    # CLAUDE_SUMMARIES_DIR to an empty location so cross-host
+    # aggregation doesn't bleed real /mnt/claude data into tests.
+    HOME="$home_dir" PATH="$TMPDIR_ROOT:$PATH" \
+        CLAUDE_SUMMARIES_DIR="$TMPDIR_ROOT/no-summaries" \
+        bash "$SCRIPT" 2>/dev/null
 }
 
 # Build a JSONL fixture line

@@ -10,6 +10,12 @@ USAGE_CACHE="${CLAUDE_DIR}/usage-cache.json"
 USAGE_CACHE_TTL=120  # seconds
 LITELLM_URL="https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 
+# Where the per-host summaries live. Each Claude host writes
+# ${CLAUDE_SUMMARIES_DIR}/${host}/personal/summary.json on a 10-minute
+# systemd timer; the widget on gnomon reads all of them here instead
+# of crawling everyone's JSONL itself. Override-able for tests.
+CLAUDE_SUMMARIES_DIR="${CLAUDE_SUMMARIES_DIR:-/mnt/claude}"
+
 CLAUDE_VERSION=$(claude --version 2>/dev/null | head -1 | grep -oP '[\d.]+' || echo "2.0.0")
 TODAY=$(date +%Y-%m-%d)
 # Calendar week: Monday to Sunday
@@ -261,6 +267,127 @@ if [ -d "$PROJECTS_DIR" ]; then
         }')
 fi
 
+# --- Cross-host aggregation from per-host summary files ---
+# Each in-scope Claude host writes ${CLAUDE_SUMMARIES_DIR}/${host}/personal/summary.json
+# every 10 minutes. We aggregate them into the same fields the local
+# JSONL pass populates — adding to whatever's already there. This is the
+# only thing that needs cross-host data; we never crawl remote JSONL.
+#
+# Local host's contribution: if a summary file exists for THIS host, we
+# include it like any other. The local JSONL pass above already counted
+# this host's data; to avoid double-counting we SKIP the same-host
+# summary when local JSONL was actually processed.
+HOST_BREAKDOWN=""
+if [ -d "$CLAUDE_SUMMARIES_DIR" ]; then
+    LOCAL_HOSTNAME="$(uname -n)"
+    # Per-host today_tokens used to build HOST_BREAKDOWN (sorted desc).
+    # awk gives us numeric sort without pulling sort(1)'s -k --version-sort fuss.
+    BREAK_RAW=""
+    for sum in "$CLAUDE_SUMMARIES_DIR"/*/personal/summary.json; do
+        [ -f "$sum" ] || continue
+        host=$(jq -r '.host // ""' "$sum" 2>/dev/null || echo "")
+        [ -n "$host" ] || continue
+
+        s_today_tokens=$(jq -r '.today_tokens // 0'   "$sum" 2>/dev/null || echo 0)
+        s_today_cost=$(jq -r   '.today_cost_usd // 0' "$sum" 2>/dev/null || echo 0)
+        s_week_tokens=$(jq -r  '.week_tokens // 0'    "$sum" 2>/dev/null || echo 0)
+        s_week_cost=$(jq -r    '.week_cost_usd // 0'  "$sum" 2>/dev/null || echo 0)
+        s_week_msgs=$(jq -r    '.week_messages // 0'  "$sum" 2>/dev/null || echo 0)
+        s_week_sess=$(jq -r    '.week_sessions // 0'  "$sum" 2>/dev/null || echo 0)
+        s_month_tokens=$(jq -r '.month_tokens // 0'   "$sum" 2>/dev/null || echo 0)
+        s_month_cost=$(jq -r   '.month_cost_usd // 0' "$sum" 2>/dev/null || echo 0)
+        s_daily=$(jq -r        '.daily_tokens | @csv'      "$sum" 2>/dev/null || echo "0,0,0,0,0,0,0")
+        s_dailyc=$(jq -r       '.daily_costs  | @csv'      "$sum" 2>/dev/null || echo "0,0,0,0,0,0,0")
+        s_models=$(jq -r       '.week_per_model | to_entries | map("\(.key):\(.value)") | join(",")' "$sum" 2>/dev/null || echo "")
+
+        # Don't double-count local host (local JSONL pass above already did).
+        if [ "$host" = "$LOCAL_HOSTNAME" ] && [ -d "$PROJECTS_DIR" ]; then
+            # We still want today_tokens for HOST_BREAKDOWN — use local
+            # totals which are at least as fresh.
+            : "use local values; below adds to BREAK_RAW from local pass"
+        else
+            # Aggregate scalars
+            WEEK_TOKENS=$((WEEK_TOKENS + s_week_tokens))
+            WEEK_MESSAGES=$((WEEK_MESSAGES + s_week_msgs))
+            WEEK_SESSIONS=$((WEEK_SESSIONS + s_week_sess))
+            MONTH_TOKENS=$((MONTH_TOKENS + s_month_tokens))
+            TODAY_COST=$(awk -v a="$TODAY_COST" -v b="$s_today_cost"  'BEGIN{printf "%.2f", a + b}')
+            WEEK_COST=$(awk  -v a="$WEEK_COST"  -v b="$s_week_cost"   'BEGIN{printf "%.2f", a + b}')
+            MONTH_COST=$(awk -v a="$MONTH_COST" -v b="$s_month_cost"  'BEGIN{printf "%.2f", a + b}')
+
+            # Aggregate DAILY arrays (CSV of 7 ints / floats)
+            DAILY=$(awk -F, -v a="$DAILY" -v b="$s_daily" 'BEGIN{
+                na = split(a, aa, ","); split(b, bb, ",")
+                for (i = 1; i <= 7; i++) printf "%d%s", (aa[i]+0)+(bb[i]+0), (i<7?",":"\n")
+            }')
+            DAILY_COSTS=$(awk -F, -v a="$DAILY_COSTS" -v b="$s_dailyc" 'BEGIN{
+                na = split(a, aa, ","); split(b, bb, ",")
+                for (i = 1; i <= 7; i++) printf "%.2f%s", (aa[i]+0)+(bb[i]+0), (i<7?",":"\n")
+            }')
+
+            # Merge WEEK_MODELS — combine family:tokens entries
+            WEEK_MODELS=$(awk -v a="$WEEK_MODELS" -v b="$s_models" 'BEGIN{
+                n = split(a, aa, ","); for (i=1;i<=n;i++) { split(aa[i], p, ":"); if (p[1]!="") tot[p[1]] += p[2]+0 }
+                n = split(b, bb, ","); for (i=1;i<=n;i++) { split(bb[i], p, ":"); if (p[1]!="") tot[p[1]] += p[2]+0 }
+                first = 1
+                for (k in tot) { printf "%s%s:%d", (first?"":","), k, tot[k]; first = 0 }
+                if (first) printf ""  # empty
+                printf "\n"
+            }')
+        fi
+
+        # HOST_BREAKDOWN: include this host's today_tokens for ALL hosts
+        # (including local if no local JSONL pass — falls back to summary).
+        if [ "$host" = "$LOCAL_HOSTNAME" ] && [ -d "$PROJECTS_DIR" ]; then
+            # Local pass already computed today_tokens into DAILY[todayIdx];
+            # use the summary's value as a fallback if local was zero.
+            t_for_break="$s_today_tokens"
+        else
+            t_for_break="$s_today_tokens"
+        fi
+        if [ "$t_for_break" -gt 0 ] 2>/dev/null; then
+            BREAK_RAW="${BREAK_RAW}${BREAK_RAW:+
+}${t_for_break} ${host}"
+        fi
+    done
+
+    # Sort BREAK_RAW desc by today_tokens, format as "host:tokens,host:tokens,..."
+    if [ -n "$BREAK_RAW" ]; then
+        HOST_BREAKDOWN=$(echo "$BREAK_RAW" | sort -rn | awk '{printf "%s%s:%d", (NR==1?"":","), $2, $1}')
+    fi
+fi
+
+# --- 7-day projection (extrapolate utilization to reset) ---
+PROJECTED_SEVEN_DAY="0"
+SEVEN_DAY_DELTA="0"
+SEVEN_DAY_ELAPSED_FRAC="0"
+if [ -n "$SEVEN_DAY_RESET" ]; then
+    # epoch arithmetic. SEVEN_DAY_RESET is ISO 8601 with timezone.
+    reset_epoch=$(date -d "$SEVEN_DAY_RESET" +%s 2>/dev/null || echo 0)
+    now_epoch=$(date +%s)
+    if [ "$reset_epoch" -gt 0 ]; then
+        # 7-day window = 604800 seconds. elapsed = now - (reset - 7d).
+        window_start=$((reset_epoch - 604800))
+        elapsed_s=$((now_epoch - window_start))
+        # awk for the float math
+        read -r PROJECTED_SEVEN_DAY SEVEN_DAY_DELTA SEVEN_DAY_ELAPSED_FRAC <<<"$(
+            awk -v util="$SEVEN_DAY_UTIL" -v elapsed="$elapsed_s" 'BEGIN{
+                frac = elapsed / 604800.0
+                if (frac < 0) frac = 0
+                if (frac > 1) frac = 1
+                # Only project once meaningful time has elapsed (>1% of window
+                # = ~1.7h). Before that the extrapolation is wildly noisy.
+                if (frac > 0.01) {
+                    projected = util / frac
+                } else {
+                    projected = 0
+                }
+                printf "%.1f %.1f %.3f\n", projected, projected - 100, frac
+            }'
+        )"
+    fi
+fi
+
 # --- All-time from stats cache (supplementary) ---
 if [ -f "$STATS_CACHE" ]; then
     ALLTIME_SESSIONS=$(jq -r '.totalSessions // 0' "$STATS_CACHE" 2>/dev/null || echo 0)
@@ -291,3 +418,7 @@ echo "WEEK_COST=${WEEK_COST}"
 echo "MONTH_COST=${MONTH_COST}"
 echo "DAILY_COSTS=${DAILY_COSTS}"
 echo "USD_EUR_RATE=${USD_EUR_RATE}"
+echo "HOST_BREAKDOWN=${HOST_BREAKDOWN}"
+echo "PROJECTED_SEVEN_DAY=${PROJECTED_SEVEN_DAY}"
+echo "SEVEN_DAY_DELTA=${SEVEN_DAY_DELTA}"
+echo "SEVEN_DAY_ELAPSED_FRAC=${SEVEN_DAY_ELAPSED_FRAC}"

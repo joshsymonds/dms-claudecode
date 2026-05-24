@@ -59,6 +59,10 @@ assert_eq "$(jq -r .week_tokens "$OUT1")" "0" "week_tokens = 0 for empty"
 assert_eq "$(jq -r '.daily_tokens | length' "$OUT1")" "7" "daily_tokens has 7 entries"
 assert_eq "$(jq -r '.daily_costs | length' "$OUT1")" "7" "daily_costs has 7 entries"
 assert_eq "$(jq -r .profile "$OUT1")" "personal" "profile field is 'personal'"
+assert_eq "$(jq -r .week_messages "$OUT1")" "0" "week_messages defaults to 0"
+assert_eq "$(jq -r .week_sessions "$OUT1")" "0" "week_sessions defaults to 0"
+assert_eq "$(jq -r .month_tokens "$OUT1")" "0" "month_tokens defaults to 0"
+assert_eq "$(jq -r '.month_cost_usd == 0' "$OUT1")" "true" "month_cost_usd defaults to 0"
 
 # ============================================================
 echo "=== Test 2: nonexistent projects dir produces zero summary ==="
@@ -94,6 +98,9 @@ assert_eq "$(jq -r '.today_per_model.opus' "$OUT3")" "1800" "today_per_model.opu
 assert_eq "$(jq -r '.today_per_model.sonnet // 0' "$OUT3")" "0" "today_per_model.sonnet absent"
 assert_eq "$(jq -r '.week_per_model.opus' "$OUT3")" "1800" "week_per_model.opus = 1800"
 assert_eq "$(jq -r '.week_per_model.sonnet' "$OUT3")" "1350" "week_per_model.sonnet = 1350"
+assert_eq "$(jq -r .week_messages "$OUT3")" "2" "week_messages: 2 distinct assistant entries"
+assert_eq "$(jq -r .week_sessions "$OUT3")" "1" "week_sessions: 1 distinct sessionId"
+assert_eq "$(jq -r .month_tokens "$OUT3")" "3150" "month_tokens (both days in current month)"
 
 # ============================================================
 echo "=== Test 4: pricing applied when pricing-cache present ==="
