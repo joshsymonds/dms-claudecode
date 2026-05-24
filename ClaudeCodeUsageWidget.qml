@@ -48,6 +48,20 @@ PluginComponent {
     // Daily breakdown (rolling 7 days, computed from JSONL files)
     property var dailyTokens: [0, 0, 0, 0, 0, 0, 0]
 
+    // Cross-host aggregation from /mnt/claude/*/personal/summary.json
+    // (emitted by get-claude-usage). hostBreakdown is the raw
+    // "host:tokens,host:tokens,..." string, hostBreakdownList is the
+    // parsed [{host, tokens}, ...] array used by the popout row.
+    property string hostBreakdown: ""
+    property var hostBreakdownList: []
+
+    // 7-day projection (linear extrapolation of utilization to reset).
+    // projectedSevenDay is a percentage; sevenDayDelta is (projected - 100)
+    // so positive = over the cap, negative = headroom.
+    property real projectedSevenDay: 0
+    property real sevenDayDelta: 0
+    property real sevenDayElapsedFrac: 0
+
     // Estimated API cost (in USD)
     property real todayCost: 0
     property real weekCost: 0
@@ -158,6 +172,45 @@ PluginComponent {
         return tier
     }
 
+    // Compact countdown for the ring centers. mode picks the natural
+    // unit: "hours-or-mins" for the 5h ring, "days-or-hours" for the
+    // 7d ring. Always <=4 chars so it stays legible at ~28px.
+    function formatCompactCountdown(remainingMs, mode) {
+        if (!remainingMs || remainingMs <= 0) return "0"
+        if (mode === "hours-or-mins") {
+            var h = Math.floor(remainingMs / 3600000)
+            if (h > 0) return h + "h"
+            var m = Math.floor(remainingMs / 60000)
+            return m + "m"
+        }
+        // "days-or-hours"
+        var d = Math.floor(remainingMs / 86400000)
+        if (d > 0) return d + "d"
+        var hh = Math.floor(remainingMs / 3600000)
+        return hh + "h"
+    }
+
+    // Compact countdown text bound to the live countdownNow tick.
+    property string fiveHourCompact: {
+        if (!fiveHourReset) return ""
+        var remaining = Math.max(0, new Date(fiveHourReset).getTime() - countdownNow)
+        return formatCompactCountdown(remaining, "hours-or-mins")
+    }
+    property string sevenDayCompact: {
+        if (!sevenDayReset) return ""
+        var remaining = Math.max(0, new Date(sevenDayReset).getTime() - countdownNow)
+        return formatCompactCountdown(remaining, "days-or-hours")
+    }
+
+    // Color for the 7-day projection headline. Tighter thresholds than
+    // progressColor() because the projection is a forward-looking number
+    // and 90-100% means "barely making it" — worth surfacing in amber.
+    function projectionColor(projected) {
+        if (projected > 100) return Theme.error
+        if (projected > 90) return Theme.warning
+        return Theme.primary
+    }
+
     function parseLine(line) {
         var idx = line.indexOf("=")
         if (idx < 0) return
@@ -208,6 +261,22 @@ PluginComponent {
                 carr.push(k < cparts.length ? (parseFloat(cparts[k]) || 0) : 0)
             dailyCosts = carr
             break
+        case "HOST_BREAKDOWN":
+            hostBreakdown = val
+            var hl = []
+            if (val.length > 0) {
+                var hp = val.split(",")
+                for (var hi = 0; hi < hp.length; hi++) {
+                    var hkv = hp[hi].split(":")
+                    if (hkv.length === 2)
+                        hl.push({host: hkv[0], tokens: parseInt(hkv[1]) || 0})
+                }
+            }
+            hostBreakdownList = hl
+            break
+        case "PROJECTED_SEVEN_DAY": projectedSevenDay = parseFloat(val) || 0; break
+        case "SEVEN_DAY_DELTA": sevenDayDelta = parseFloat(val) || 0; break
+        case "SEVEN_DAY_ELAPSED_FRAC": sevenDayElapsedFrac = parseFloat(val) || 0; break
         }
     }
 
@@ -309,13 +378,17 @@ PluginComponent {
             LabeledRing {
                 anchors.verticalCenter: parent.verticalCenter
                 percent: root.fiveHourUtil
-                label: "5h"
+                // Top/leading ring is always the 5h window; center shows
+                // countdown until the window resets in the shortest
+                // useful unit ("2h" or "14m").
+                label: root.fiveHourCompact || "5h"
             }
 
             LabeledRing {
                 anchors.verticalCenter: parent.verticalCenter
                 percent: root.sevenDayUtil
-                label: "1w"
+                // Trailing ring is always the 7d window ("3d" or "12h").
+                label: root.sevenDayCompact || "7d"
             }
         }
     }
@@ -327,13 +400,13 @@ PluginComponent {
             LabeledRing {
                 anchors.horizontalCenter: parent.horizontalCenter
                 percent: root.fiveHourUtil
-                label: "5h"
+                label: root.fiveHourCompact || "5h"
             }
 
             LabeledRing {
                 anchors.horizontalCenter: parent.horizontalCenter
                 percent: root.sevenDayUtil
-                label: "1w"
+                label: root.sevenDayCompact || "7d"
             }
         }
     }
@@ -512,6 +585,41 @@ PluginComponent {
                     }
                 }
 
+                // --- 7-Day Projection card ---
+                // Linear extrapolation of seven_day.utilization to the
+                // reset, computed in get-claude-usage. Hidden until at
+                // least 1% of the window has elapsed (~100 min) since
+                // earlier than that the extrapolation is wildly noisy.
+                StyledRect {
+                    width: parent.width
+                    height: projectionCol.implicitHeight + Theme.spacingM * 2
+                    color: Theme.surfaceContainerHigh
+                    visible: root.sevenDayElapsedFrac >= 0.01
+
+                    Column {
+                        id: projectionCol
+                        anchors.fill: parent
+                        anchors.margins: Theme.spacingM
+                        spacing: Theme.spacingXS
+
+                        StyledText {
+                            text: root.tr("On track for ~") + Math.round(root.projectedSevenDay) + "%"
+                            font.pixelSize: Theme.fontSizeLarge
+                            font.weight: Font.DemiBold
+                            color: root.projectionColor(root.projectedSevenDay)
+                        }
+                        StyledText {
+                            // delta > 0 = over the cap (slow down by N%)
+                            // delta < 0 = headroom (X% under)
+                            text: root.sevenDayDelta > 0
+                                ? root.tr("Slow down") + " ~" + Math.round(root.sevenDayDelta) + "%"
+                                : Math.round(-root.sevenDayDelta) + "% " + root.tr("headroom")
+                            font.pixelSize: Theme.fontSizeMedium
+                            color: Theme.surfaceVariantText
+                        }
+                    }
+                }
+
                 // --- Token Consumption card ---
                 StyledRect {
                     width: parent.width
@@ -609,6 +717,24 @@ PluginComponent {
                                     color: Theme.surfaceVariantText
                                     anchors.horizontalCenter: parent.horizontalCenter
                                     visible: root.monthCost > 0
+                                }
+                            }
+                        }
+
+                        // Per-host today breakdown. Only show when ≥2 hosts
+                        // have non-zero today data — for the common single-
+                        // host case the aggregate row above already conveys it.
+                        Flow {
+                            width: parent.width
+                            spacing: Theme.spacingM
+                            visible: root.hostBreakdownList.length >= 2
+
+                            Repeater {
+                                model: root.hostBreakdownList
+                                StyledText {
+                                    text: modelData.host + " " + root.formatTokens(modelData.tokens)
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    color: Theme.surfaceVariantText
                                 }
                             }
                         }

@@ -33,6 +33,13 @@ var strings = {
         { fr: "Modèles cette semaine" },
     "Since":
         { fr: "Depuis" },
+    // Projection / cross-host
+    "On track for ~":
+        { fr: "En route pour ~" },
+    "Slow down":
+        { fr: "Ralentissez" },
+    "headroom":
+        { fr: "de marge" },
     // Settings
     "Monitor your Claude Code subscription usage. Rate limits and subscription tier are detected automatically via the Anthropic API.":
         { fr: "Surveillez l'utilisation de votre abonnement Claude Code. Les limites et le type d'abonnement sont détectés automatiquement via l'API Anthropic." },

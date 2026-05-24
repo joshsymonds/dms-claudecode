@@ -42,6 +42,26 @@ function progressColor(pct) {
     return "primary"
 }
 
+function formatCompactCountdown(remainingMs, mode) {
+    if (!remainingMs || remainingMs <= 0) return "0"
+    if (mode === "hours-or-mins") {
+        var h = Math.floor(remainingMs / 3600000)
+        if (h > 0) return h + "h"
+        var m = Math.floor(remainingMs / 60000)
+        return m + "m"
+    }
+    var d = Math.floor(remainingMs / 86400000)
+    if (d > 0) return d + "d"
+    var hh = Math.floor(remainingMs / 3600000)
+    return hh + "h"
+}
+
+function projectionColor(projected) {
+    if (projected > 100) return "error"
+    if (projected > 90) return "warning"
+    return "primary"
+}
+
 function formatTier(tier) {
     if (tier.indexOf("max_20x") >= 0) return "Max 20x"
     if (tier.indexOf("max_5x") >= 0) return "Max 5x"
@@ -117,6 +137,21 @@ function parseLine(line, state) {
             carr.push(k < cparts.length ? (parseFloat(cparts[k]) || 0) : 0)
         state.dailyCosts = carr
         break
+    case "HOST_BREAKDOWN":
+        state.hostBreakdown = val
+        state.hostBreakdownList = []
+        if (val.length > 0) {
+            var hp = val.split(",")
+            for (var hi = 0; hi < hp.length; hi++) {
+                var hkv = hp[hi].split(":")
+                if (hkv.length === 2)
+                    state.hostBreakdownList.push({host: hkv[0], tokens: parseInt(hkv[1]) || 0})
+            }
+        }
+        break
+    case "PROJECTED_SEVEN_DAY": state.projectedSevenDay = parseFloat(val) || 0; break
+    case "SEVEN_DAY_DELTA": state.sevenDayDelta = parseFloat(val) || 0; break
+    case "SEVEN_DAY_ELAPSED_FRAC": state.sevenDayElapsedFrac = parseFloat(val) || 0; break
     }
     return state
 }
@@ -402,6 +437,89 @@ if [ "$RESULT_MODELS_BAD" = '[{"modelName":"opus","modelTokens":5000},{"modelNam
     pass "parseLine WEEK_MODELS malformed entry skipped"
 else
     fail "parseLine WEEK_MODELS malformed expected opus+sonnet only, got $RESULT_MODELS_BAD"
+fi
+
+# ============================================================
+echo "=== Test: formatCompactCountdown ==="
+# ============================================================
+test_compact() {
+    local ms="$1" mode="$2" expected="$3" label="$4"
+    local result
+    result=$(run_js "${JS_HARNESS} console.log(formatCompactCountdown($ms, '$mode'))")
+    if [ "$result" = "$expected" ]; then pass "$label"; else fail "$label (expected '$expected', got '$result')"; fi
+}
+# hours-or-mins mode (for 5h ring): biggest non-zero unit
+test_compact 0           "hours-or-mins" "0"   "0ms → 0"
+test_compact -1          "hours-or-mins" "0"   "negative → 0"
+test_compact 30000       "hours-or-mins" "0m"  "30s → 0m"
+test_compact 60000       "hours-or-mins" "1m"  "1min → 1m"
+test_compact 840000      "hours-or-mins" "14m" "14min → 14m"
+test_compact 3600000     "hours-or-mins" "1h"  "1h → 1h"
+test_compact 7200000     "hours-or-mins" "2h"  "2h → 2h"
+test_compact 9000000     "hours-or-mins" "2h"  "2h30m → 2h (truncates)"
+test_compact 17999999    "hours-or-mins" "4h"  "4h59m → 4h"
+# days-or-hours mode (for 7d ring)
+test_compact 3600000     "days-or-hours" "1h"  "1h → 1h"
+test_compact 86399999    "days-or-hours" "23h" "23h59m → 23h"
+test_compact 86400000    "days-or-hours" "1d"  "exactly 1d"
+test_compact 259200000   "days-or-hours" "3d"  "3d"
+test_compact 604800000   "days-or-hours" "7d"  "7d"
+
+# ============================================================
+echo "=== Test: projectionColor ==="
+# ============================================================
+test_proj_color() {
+    local projected="$1" expected="$2" label="$3"
+    local result
+    result=$(run_js "${JS_HARNESS} console.log(projectionColor($projected))")
+    if [ "$result" = "$expected" ]; then pass "$label"; else fail "$label (expected '$expected', got '$result')"; fi
+}
+test_proj_color 0     "primary" "0% → primary"
+test_proj_color 50    "primary" "50% → primary"
+test_proj_color 90    "primary" "90% → primary"
+test_proj_color 90.1  "warning" "90.1% → warning"
+test_proj_color 100   "warning" "100% → warning (still amber, not over)"
+test_proj_color 100.1 "error"   "100.1% → error"
+test_proj_color 150   "error"   "150% → error"
+
+# ============================================================
+echo "=== Test: parseLine HOST_BREAKDOWN ==="
+# ============================================================
+RESULT_HB=$(run_js "${JS_HARNESS}
+    var s = {};
+    parseLine('HOST_BREAKDOWN=vermissian:3500000000,ultraviolet:29000000', s);
+    console.log(JSON.stringify(s.hostBreakdownList));
+")
+if [ "$RESULT_HB" = '[{"host":"vermissian","tokens":3500000000},{"host":"ultraviolet","tokens":29000000}]' ]; then
+    pass "parseLine HOST_BREAKDOWN two hosts parsed in order"
+else
+    fail "parseLine HOST_BREAKDOWN expected 2 entries, got $RESULT_HB"
+fi
+RESULT_HB_EMPTY=$(run_js "${JS_HARNESS}
+    var s = {};
+    parseLine('HOST_BREAKDOWN=', s);
+    console.log(JSON.stringify(s.hostBreakdownList));
+")
+if [ "$RESULT_HB_EMPTY" = "[]" ]; then
+    pass "parseLine HOST_BREAKDOWN empty = []"
+else
+    fail "parseLine HOST_BREAKDOWN empty expected [], got $RESULT_HB_EMPTY"
+fi
+
+# ============================================================
+echo "=== Test: parseLine projection fields ==="
+# ============================================================
+RESULT_PROJ=$(run_js "${JS_HARNESS}
+    var s = {};
+    parseLine('PROJECTED_SEVEN_DAY=77.0', s);
+    parseLine('SEVEN_DAY_DELTA=-23.0', s);
+    parseLine('SEVEN_DAY_ELAPSED_FRAC=0.286', s);
+    console.log(s.projectedSevenDay + ' ' + s.sevenDayDelta + ' ' + s.sevenDayElapsedFrac);
+")
+if [ "$RESULT_PROJ" = "77 -23 0.286" ]; then
+    pass "parseLine projection fields"
+else
+    fail "parseLine projection expected '77 -23 0.286', got '$RESULT_PROJ'"
 fi
 
 # ============================================================
