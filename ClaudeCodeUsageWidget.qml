@@ -76,6 +76,26 @@ PluginComponent {
     property real workTodayCost: 0
     property real workWeekCost: 0
     property real workMonthCost: 0
+
+    // Backend-split work costs. Bedrock = real AWS $ (us. cross-region
+    // rate). API = Anthropic list price — a real charge only on an API key;
+    // under a flat subscription (workAnthropicBilling === "subscription")
+    // the marginal cost is $0, so the charged total counts Bedrock only.
+    property real workBedrockTodayCost: 0
+    property real workBedrockWeekCost: 0
+    property real workBedrockMonthCost: 0
+    property real workApiTodayCost: 0
+    property real workApiWeekCost: 0
+    property real workApiMonthCost: 0
+    property string workAnthropicBilling: "unknown"
+    property string workSubscriptionType: ""
+    property bool workApiIsFree: workAnthropicBilling === "subscription"
+    // What you're actually billed: Bedrock always, plus the API side only
+    // when it isn't covered by a flat subscription.
+    property real workChargedTodayCost: workBedrockTodayCost + (workApiIsFree ? 0 : workApiTodayCost)
+    property real workChargedWeekCost: workBedrockWeekCost + (workApiIsFree ? 0 : workApiWeekCost)
+    property real workChargedMonthCost: workBedrockMonthCost + (workApiIsFree ? 0 : workApiMonthCost)
+
     property var dailyCosts: [0, 0, 0, 0, 0, 0, 0]
     property real usdEurRate: 0
 
@@ -286,6 +306,14 @@ PluginComponent {
         case "WORK_TODAY_COST": workTodayCost = parseFloat(val) || 0; break
         case "WORK_WEEK_COST": workWeekCost = parseFloat(val) || 0; break
         case "WORK_MONTH_COST": workMonthCost = parseFloat(val) || 0; break
+        case "WORK_BEDROCK_TODAY_COST": workBedrockTodayCost = parseFloat(val) || 0; break
+        case "WORK_BEDROCK_WEEK_COST": workBedrockWeekCost = parseFloat(val) || 0; break
+        case "WORK_BEDROCK_MONTH_COST": workBedrockMonthCost = parseFloat(val) || 0; break
+        case "WORK_API_TODAY_COST": workApiTodayCost = parseFloat(val) || 0; break
+        case "WORK_API_WEEK_COST": workApiWeekCost = parseFloat(val) || 0; break
+        case "WORK_API_MONTH_COST": workApiMonthCost = parseFloat(val) || 0; break
+        case "WORK_ANTHROPIC_BILLING": workAnthropicBilling = val; break
+        case "WORK_SUBSCRIPTION_TYPE": workSubscriptionType = val; break
         case "USD_EUR_RATE": usdEurRate = parseFloat(val) || 0; break
         case "DAILY_COSTS":
             var cparts = val.split(",")
@@ -432,7 +460,7 @@ PluginComponent {
             // room from the adjacent ring instead of butting against it.
             StyledText {
                 visible: root.showWorkCostPill
-                text: root.formatCostCompact(root.workTodayCost)
+                text: root.formatCostCompact(root.workChargedTodayCost)
                 font.pixelSize: Theme.fontSizeSmall
                 color: Theme.surfaceVariantText
                 anchors.verticalCenter: parent.verticalCenter
@@ -464,7 +492,7 @@ PluginComponent {
             // dead space top and bottom on top of the Column spacing.
             StyledText {
                 visible: root.showWorkCostPill
-                text: root.formatCostCompact(root.workTodayCost)
+                text: root.formatCostCompact(root.workChargedTodayCost)
                 font.pixelSize: Theme.fontSizeSmall
                 color: Theme.surfaceVariantText
                 anchors.horizontalCenter: parent.horizontalCenter
@@ -868,7 +896,7 @@ PluginComponent {
                                     anchors.horizontalCenter: parent.horizontalCenter
                                 }
                                 StyledText {
-                                    text: root.formatCost(root.workTodayCost)
+                                    text: root.formatCost(root.workChargedTodayCost)
                                     font.pixelSize: Theme.fontSizeLarge
                                     font.weight: Font.DemiBold
                                     color: Theme.surfaceText
@@ -887,7 +915,7 @@ PluginComponent {
                                     anchors.horizontalCenter: parent.horizontalCenter
                                 }
                                 StyledText {
-                                    text: root.formatCost(root.workWeekCost)
+                                    text: root.formatCost(root.workChargedWeekCost)
                                     font.pixelSize: Theme.fontSizeLarge
                                     font.weight: Font.DemiBold
                                     color: Theme.surfaceText
@@ -906,13 +934,40 @@ PluginComponent {
                                     anchors.horizontalCenter: parent.horizontalCenter
                                 }
                                 StyledText {
-                                    text: root.formatCost(root.workMonthCost)
+                                    text: root.formatCost(root.workChargedMonthCost)
                                     font.pixelSize: Theme.fontSizeLarge
                                     font.weight: Font.DemiBold
                                     color: Theme.primary
                                     anchors.horizontalCenter: parent.horizontalCenter
                                 }
                             }
+                        }
+
+                        // Backend breakdown: what those charged totals are
+                        // made of. Bedrock is real AWS $; the Anthropic side
+                        // is "included" under a flat subscription (so it's
+                        // excluded from the charged totals above) or a real
+                        // API charge otherwise. Today's figures.
+                        StyledText {
+                            width: parent.width
+                            wrapMode: Text.WordWrap
+                            font.pixelSize: Theme.fontSizeSmall
+                            color: Theme.surfaceVariantText
+                            text: {
+                                var parts = []
+                                if (root.workBedrockTodayCost > 0)
+                                    parts.push(root.tr("Bedrock (AWS)") + " " + root.formatCost(root.workBedrockTodayCost))
+                                if (root.workApiTodayCost > 0) {
+                                    if (root.workApiIsFree)
+                                        parts.push(root.tr("Anthropic") + " "
+                                            + (root.workSubscriptionType ? root.workSubscriptionType.toUpperCase() : root.tr("subscription"))
+                                            + " — " + root.tr("included"))
+                                    else
+                                        parts.push(root.tr("Anthropic API") + " " + root.formatCost(root.workApiTodayCost))
+                                }
+                                return parts.join("  ·  ")
+                            }
+                            visible: text.length > 0
                         }
                     }
                 }

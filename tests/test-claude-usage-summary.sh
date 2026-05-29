@@ -120,6 +120,10 @@ cat > "$ENV4/.claude/pricing-cache.json" << 'EOF'
   "models": {
     "opus":   {"input": 1.5e-05, "output": 7.5e-05, "cache_read": 1.5e-06, "cache_write": 1.875e-05},
     "sonnet": {"input": 3e-06,   "output": 1.5e-05, "cache_read": 3e-07,   "cache_write": 3.75e-06}
+  },
+  "bedrock_models": {
+    "opus":   {"input": 5.5e-06, "output": 2.75e-05, "cache_read": 5.5e-07, "cache_write": 6.875e-06},
+    "sonnet": {"input": 3.3e-06, "output": 1.65e-05, "cache_read": 3.3e-07, "cache_write": 4.125e-06}
   }
 }
 EOF
@@ -258,17 +262,22 @@ cat > "$ENV11/.claude/pricing-cache.json" << 'EOF'
   "updated": "2026-05-23",
   "models": {
     "opus": {"input": 1.5e-05, "output": 7.5e-05, "cache_read": 1.5e-06, "cache_write": 1.875e-05}
+  },
+  "bedrock_models": {
+    "opus": {"input": 5.5e-06, "output": 2.75e-05, "cache_read": 5.5e-07, "cache_write": 6.875e-06}
   }
 }
 EOF
 JSONL="$ENV11/.claude/projects/test-project/sess-1.jsonl"
 # Three rows with the same message.id, simulating streaming-chunk
 # duplicates. Cumulative usage on each is identical.
-make_jsonl_line_with_id "$TODAY" "claude-opus-4-7-20260101" 1000 500 200 100 "msg_DUP" > "$JSONL"
-make_jsonl_line_with_id "$TODAY" "claude-opus-4-7-20260101" 1000 500 200 100 "msg_DUP" >> "$JSONL"
-make_jsonl_line_with_id "$TODAY" "claude-opus-4-7-20260101" 1000 500 200 100 "msg_DUP" >> "$JSONL"
-# A second message_id, single occurrence — should be counted normally.
-make_jsonl_line_with_id "$TODAY" "claude-opus-4-7-20260101" 500 250 100 50 "msg_UNIQUE" >> "$JSONL"
+{
+    make_jsonl_line_with_id "$TODAY" "claude-opus-4-7-20260101" 1000 500 200 100 "msg_DUP"
+    make_jsonl_line_with_id "$TODAY" "claude-opus-4-7-20260101" 1000 500 200 100 "msg_DUP"
+    make_jsonl_line_with_id "$TODAY" "claude-opus-4-7-20260101" 1000 500 200 100 "msg_DUP"
+    # A second message_id, single occurrence — should be counted normally.
+    make_jsonl_line_with_id "$TODAY" "claude-opus-4-7-20260101" 500 250 100 50 "msg_UNIQUE"
+} > "$JSONL"
 OUT11="$TMPDIR_ROOT/test11.json"
 run_script "$ENV11" personal "$OUT11"
 # Expected token total = (1000+500+200+100) + (500+250+100+50) = 1800 + 900 = 2700
@@ -290,14 +299,19 @@ cat > "$ENV12/.claude/pricing-cache.json" << 'EOF'
   "updated": "2026-05-23",
   "models": {
     "opus": {"input": 1.5e-05, "output": 7.5e-05, "cache_read": 1.5e-06, "cache_write": 1.875e-05}
+  },
+  "bedrock_models": {
+    "opus": {"input": 5.5e-06, "output": 2.75e-05, "cache_read": 5.5e-07, "cache_write": 6.875e-06}
   }
 }
 EOF
 JSONL="$ENV12/.claude/projects/test-project/sess-1.jsonl"
 # Three rows WITHOUT message.id — all three should count.
-make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 1000 500 200 100 > "$JSONL"
-make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 1000 500 200 100 >> "$JSONL"
-make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 1000 500 200 100 >> "$JSONL"
+{
+    make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 1000 500 200 100
+    make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 1000 500 200 100
+    make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 1000 500 200 100
+} > "$JSONL"
 OUT12="$TMPDIR_ROOT/test12.json"
 run_script "$ENV12" personal "$OUT12"
 # Expected: 3 * (1000+500+200+100) = 5400
@@ -320,11 +334,50 @@ YESTERDAY_TS=$(date -u -d "@$((LOCAL_MIDNIGHT_EPOCH - 1800))" +"%Y-%m-%dT%H:%M:%
 # 30 min after today's local midnight = early today-local
 TODAY_TS=$(date -u -d "@$((LOCAL_MIDNIGHT_EPOCH + 1800))" +"%Y-%m-%dT%H:%M:%S.000Z")
 JSONL="$ENV13/.claude/projects/test-project/sess-1.jsonl"
-printf '{"type":"assistant","timestamp":"%s","sessionId":"sess","message":{"id":"msg-y","model":"claude-opus-4-7-20260101","usage":{"input_tokens":100,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n' "$YESTERDAY_TS" > "$JSONL"
-printf '{"type":"assistant","timestamp":"%s","sessionId":"sess","message":{"id":"msg-t","model":"claude-opus-4-7-20260101","usage":{"input_tokens":200,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n' "$TODAY_TS" >> "$JSONL"
+{
+    printf '{"type":"assistant","timestamp":"%s","sessionId":"sess","message":{"id":"msg-y","model":"claude-opus-4-7-20260101","usage":{"input_tokens":100,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n' "$YESTERDAY_TS"
+    printf '{"type":"assistant","timestamp":"%s","sessionId":"sess","message":{"id":"msg-t","model":"claude-opus-4-7-20260101","usage":{"input_tokens":200,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n' "$TODAY_TS"
+} > "$JSONL"
 OUT13="$TMPDIR_ROOT/test13.json"
 run_script "$ENV13" personal "$OUT13"
 assert_eq "$(jq -r .today_tokens "$OUT13")" "200" "today_tokens excludes yesterday-local UTC-late timestamps"
+
+# ============================================================
+echo "=== Test 14: backend split — Bedrock (msg_bdrk_) vs Anthropic (msg_01) ==="
+# ============================================================
+# message.id prefix selects the backend, which selects the price table:
+# msg_bdrk_* → bedrock_models (us. cross-region rate); msg_01* → models
+# (Anthropic list). Subscription is detected from the profile credentials.
+ENV14=$(setup_env "test14")
+cat > "$ENV14/.claude/pricing-cache.json" << 'EOF'
+{
+  "updated": "2026-05-23",
+  "models": {
+    "opus": {"input": 1.5e-05, "output": 0, "cache_read": 0, "cache_write": 0}
+  },
+  "bedrock_models": {
+    "opus": {"input": 5.5e-06, "output": 0, "cache_read": 0, "cache_write": 0}
+  }
+}
+EOF
+# Work profile reuses the personal pricing-cache (pricing is global).
+cp "$ENV14/.claude/pricing-cache.json" "$ENV14/.claude-work/pricing-cache.json" 2>/dev/null || true
+echo '{"claudeAiOauth":{"subscriptionType":"max"}}' > "$ENV14/.claude-work/.credentials.json"
+JSONL="$ENV14/.claude-work/projects/work-project/sess-1.jsonl"
+# 1000 input tokens each; output/cache zero so the math is trivial.
+{
+    make_jsonl_line_with_id "$TODAY" "claude-opus-4-7-20260101" 1000 0 0 0 "msg_bdrk_AAA"
+    make_jsonl_line_with_id "$TODAY" "claude-opus-4-7-20260101" 1000 0 0 0 "msg_011BBB"
+} > "$JSONL"
+OUT14="$TMPDIR_ROOT/test14.json"
+run_script "$ENV14" work "$OUT14"
+# Bedrock: 1000 * 5.5e-6 = 0.0055 ; API: 1000 * 1.5e-5 = 0.0150
+assert_eq "$(jq -r .today_bedrock_cost_usd "$OUT14")" "0.0055" "bedrock msg priced at us. cross-region rate"
+assert_eq "$(jq -r .today_api_cost_usd "$OUT14")"     "0.0150" "anthropic msg priced at list rate"
+assert_eq "$(jq -r .anthropic_billing "$OUT14")"      "subscription" "subscription detected from credentials"
+assert_eq "$(jq -r .subscription_type "$OUT14")"      "max" "subscription type captured"
+assert_eq "$(jq -r .today_bedrock_tokens "$OUT14")"   "1000" "bedrock tokens split out"
+assert_eq "$(jq -r .today_anthropic_tokens "$OUT14")" "1000" "anthropic tokens split out"
 
 # ============================================================
 echo "=========================================="

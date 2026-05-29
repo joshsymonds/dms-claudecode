@@ -78,22 +78,33 @@ GENERATED="$(date -Iseconds)"
 refresh_pricing() {
     local raw result eur_rate check
     raw=$(curl -s --max-time 10 "$LITELLM_URL" 2>/dev/null) || return 1
-    result=$(echo "$raw" | jq -c '{
-        updated: "'"$TODAY"'",
-        models: ([to_entries[]
-            | select(.key | test("^claude-[a-z]+-[0-9]+-[0-9]+$"))
-            | select(.value.input_cost_per_token > 0)
-            | { family: (.key | split("-") | .[1]), key: .key, value: .value }
-        ] | group_by(.family)
-          | map(sort_by(.key) | last
-              | {key: .family, value: {
-                    input: .value.input_cost_per_token,
-                    output: .value.output_cost_per_token,
-                    cache_read: .value.cache_read_input_token_cost,
-                    cache_write: .value.cache_creation_input_token_cost
-                }})
-          | from_entries)
-    }' 2>/dev/null) || return 1
+    # Two price tables. `models` = Anthropic list rate (msg_01* / API key).
+    # `bedrock_models` = the us.* cross-region inference-profile rate
+    # (msg_bdrk_*), which AWS prices ~10% above the base SKU — and the us.
+    # geo profile is what this deployment invokes (AWS_REGION=us-east-2,
+    # model id us.anthropic.*). Both group by family and take the latest
+    # version. A consumer in a different geo (eu./au.) would need its own
+    # prefix; us. is correct here.
+    result=$(echo "$raw" | jq -c '
+        def latest_per_family(re):
+            [ to_entries[]
+              | select(.key | test(re))
+              | select(.value.input_cost_per_token > 0)
+              | { family: (.key | split("-") | .[1]), key: .key, value: .value } ]
+            | group_by(.family)
+            | map(sort_by(.key) | last
+                | {key: .family, value: {
+                      input: .value.input_cost_per_token,
+                      output: .value.output_cost_per_token,
+                      cache_read: .value.cache_read_input_token_cost,
+                      cache_write: .value.cache_creation_input_token_cost
+                  }})
+            | from_entries;
+        {
+            updated: "'"$TODAY"'",
+            models: latest_per_family("^claude-[a-z]+-[0-9]+-[0-9]+$"),
+            bedrock_models: latest_per_family("^us\\.anthropic\\.claude-[a-z]+-[0-9]")
+        }' 2>/dev/null) || return 1
     eur_rate=$(curl -s --max-time 5 "https://api.frankfurter.app/latest?from=USD&to=EUR" 2>/dev/null \
         | jq -r '.rates.EUR // empty' 2>/dev/null) || eur_rate=""
     if [ -n "$eur_rate" ] && [[ "$eur_rate" =~ ^[0-9]+\.?[0-9]*$ ]]; then
@@ -109,7 +120,7 @@ refresh_pricing() {
 # is gnomon's responsibility via get-claude-usage's daily refresh; we
 # don't want every host hammering LiteLLM and we don't want tests with
 # pre-seeded stale caches to trigger network calls.
-if [ ! -f "$PRICING_CACHE" ]; then
+if [ ! -f "$PRICING_CACHE" ] || ! jq -e '.bedrock_models' "$PRICING_CACHE" >/dev/null 2>&1; then
     refresh_pricing || true
 fi
 
@@ -118,22 +129,49 @@ fi
 # global, not per-profile. If still unavailable after refresh attempt (no
 # network, etc.), costs come out as zero and the bar shows token totals only.
 PRICING_AWK=""
+PRICING_BEDROCK_AWK=""
 if [ -f "$PRICING_CACHE" ]; then
     PRICING_AWK=$(jq -r '
         [.models | to_entries[]
          | "\(.key):\(.value.input):\(.value.output):\(.value.cache_read):\(.value.cache_write)"]
         | join(",")' "$PRICING_CACHE" 2>/dev/null || echo "")
+    PRICING_BEDROCK_AWK=$(jq -r '
+        [(.bedrock_models // {}) | to_entries[]
+         | "\(.key):\(.value.input):\(.value.output):\(.value.cache_read):\(.value.cache_write)"]
+        | join(",")' "$PRICING_CACHE" 2>/dev/null || echo "")
+fi
+
+# How the Anthropic side of this profile is billed. If an OAuth
+# subscription token is present, msg_01* usage is covered by a flat plan
+# (no marginal $); otherwise it's an API key billed at list price. Bedrock
+# (msg_bdrk_*) is always real AWS $ regardless. Consumers use this to
+# decide whether api_cost_usd is a real charge or "included".
+ANTHROPIC_BILLING="api_key"
+SUBSCRIPTION_TYPE=""
+if [ -f "$PROFILE_DIR/.credentials.json" ]; then
+    st=$(jq -r '.claudeAiOauth.subscriptionType // ""' "$PROFILE_DIR/.credentials.json" 2>/dev/null || echo "")
+    if [ -n "$st" ] && [ "$st" != "null" ]; then
+        ANTHROPIC_BILLING="subscription"
+        SUBSCRIPTION_TYPE="$st"
+    fi
 fi
 
 emit_zero() {
     mkdir -p "$(dirname "$OUT")"
     jq -n --arg host "$HOSTNAME_NOW" --arg profile "$PROFILE" --arg generated "$GENERATED" \
+        --arg billing "$ANTHROPIC_BILLING" --arg subtype "$SUBSCRIPTION_TYPE" \
         '{host: $host, profile: $profile, generated_at: $generated,
           today_tokens: 0, today_cost_usd: 0, today_per_model: {},
           week_tokens: 0,  week_cost_usd: 0,  week_per_model: {},
           week_messages: 0, week_sessions: 0,
           month_tokens: 0, month_cost_usd: 0,
-          daily_tokens: [0,0,0,0,0,0,0], daily_costs: [0,0,0,0,0,0,0]}' \
+          daily_tokens: [0,0,0,0,0,0,0], daily_costs: [0,0,0,0,0,0,0],
+          anthropic_billing: $billing, subscription_type: $subtype,
+          today_bedrock_cost_usd: 0, today_api_cost_usd: 0,
+          week_bedrock_cost_usd: 0,  week_api_cost_usd: 0,
+          month_bedrock_cost_usd: 0, month_api_cost_usd: 0,
+          today_bedrock_tokens: 0, today_anthropic_tokens: 0,
+          week_bedrock_tokens: 0,  week_anthropic_tokens: 0}' \
         > "$OUT.tmp" && mv "$OUT.tmp" "$OUT"
 }
 
@@ -184,8 +222,12 @@ RESULT=$(find -H "$PROJECTS" -name '*.jsonl' -mtime -31 -exec cat {} + 2>/dev/nu
         # same requestId, so this joint key collapses them. The "no-id"
         # / "no-req" fallbacks are kept distinct so legacy fixtures
         # without these fields are not all collapsed into one row.
-        | "\(((.timestamp[:19]) + "Z") | fromdateiso8601 | localtime | strftime("%Y-%m-%d")) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0) \(.sessionId // "unknown") \(.message.id // "no-id"):\(.requestId // "no-req")"' \
-    | awk -v today="$TODAY" -v week_start="$WEEK_START" -v month_start="$MONTH_START" -v day_dates="$DAY_DATES" -v pricing="$PRICING_AWK" '
+        # Trailing field is the BACKEND, derived from message.id: Bedrock
+        # stamps a `msg_bdrk_` prefix, the Anthropic API uses `msg_01...`.
+        # This is the only per-message signal of which backend (and thus
+        # which bill — AWS vs Anthropic) served the response.
+        | "\(((.timestamp[:19]) + "Z") | fromdateiso8601 | localtime | strftime("%Y-%m-%d")) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0) \(.sessionId // "unknown") \(.message.id // "no-id"):\(.requestId // "no-req") \((.message.id // "") | if startswith("msg_bdrk") then "bedrock" else "anthropic" end)"' \
+    | awk -v today="$TODAY" -v week_start="$WEEK_START" -v month_start="$MONTH_START" -v day_dates="$DAY_DATES" -v pricing="$PRICING_AWK" -v pricing_bedrock="$PRICING_BEDROCK_AWK" '
 BEGIN {
     split(day_dates, dates, ",")
     has_pricing = 0
@@ -200,11 +242,21 @@ BEGIN {
         }
         has_pricing = 1
     }
+    if (pricing_bedrock != "") {
+        n = split(pricing_bedrock, bmodels, ",")
+        for (i = 1; i <= n; i++) {
+            split(bmodels[i], bp, ":")
+            bprice_in[bp[1]] = bp[2] + 0
+            bprice_out[bp[1]] = bp[3] + 0
+            bprice_cr[bp[1]] = bp[4] + 0
+            bprice_cw[bp[1]] = bp[5] + 0
+        }
+    }
 }
 {
     date = $1; model = $2
     inp = $3 + 0; out = $4 + 0; cr = $5 + 0; cw = $6 + 0
-    sess = $7; dedup_key = $8
+    sess = $7; dedup_key = $8; backend = $9
 
     # Dedup by composite (message.id, requestId) key, matching the
     # canonical hash ccusage uses (its issue #389). Claude Code emits
@@ -228,21 +280,33 @@ BEGIN {
     if (date == today) {
         today_tokens += total
         today_model[family] += total
+        if (backend == "bedrock") today_bedrock_tokens += total; else today_anthropic_tokens += total
     }
     if (date >= week_start) {
         week_tokens += total
         week_model[family] += total
         week_messages++
         week_sess[sess] = 1
+        if (backend == "bedrock") week_bedrock_tokens += total; else week_anthropic_tokens += total
     }
     if (date >= month_start) month_tokens += total
 
-    if (has_pricing && (family in price_in)) {
+    # Price with the backend-appropriate table: Bedrock messages at the us.
+    # cross-region rate (real AWS $); Anthropic messages at list rate (the
+    # real charge only on an API key — $0 under a flat subscription, which
+    # the consumer decides via anthropic_billing). Bedrock falls back to the
+    # base list rate if the bedrock table is unavailable (~10% low).
+    cost = 0
+    if (backend == "bedrock" && (family in bprice_in)) {
+        cost = inp * bprice_in[family] + out * bprice_out[family] + cr * bprice_cr[family] + cw * bprice_cw[family]
+    } else if (has_pricing && (family in price_in)) {
         cost = inp * price_in[family] + out * price_out[family] + cr * price_cr[family] + cw * price_cw[family]
+    }
+    if (cost > 0) {
         day_cost[date] += cost
-        if (date == today)       today_cost += cost
-        if (date >= week_start)  week_cost  += cost
-        if (date >= month_start) month_cost += cost
+        if (date == today)       { today_cost += cost; if (backend == "bedrock") today_bedrock_cost += cost; else today_api_cost += cost }
+        if (date >= week_start)  { week_cost  += cost; if (backend == "bedrock") week_bedrock_cost  += cost; else week_api_cost  += cost }
+        if (date >= month_start) { month_cost += cost; if (backend == "bedrock") month_bedrock_cost += cost; else month_api_cost += cost }
     }
 }
 END {
@@ -273,13 +337,20 @@ END {
     # Count distinct week sessions
     n_sess = 0; for (s in week_sess) n_sess++
 
-    # Tab-separated scalars + JSON fragments
-    printf "%d\t%.4f\t%d\t%.4f\t%d\t%d\t%d\t%.4f\t[%s]\t[%s]\t%s\t%s\n", \
+    # Tab-separated scalars + JSON fragments. Fields 13+ are the
+    # backend-split costs and tokens added for accurate AWS-vs-Anthropic
+    # attribution; appended after the original 12 so field order is stable.
+    printf "%d\t%.4f\t%d\t%.4f\t%d\t%d\t%d\t%.4f\t[%s]\t[%s]\t%s\t%s\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%d\t%d\t%d\t%d\n", \
         today_tokens + 0, today_cost + 0, \
         week_tokens + 0, week_cost + 0, \
         week_messages + 0, n_sess + 0, \
         month_tokens + 0, month_cost + 0, \
-        daily_t, daily_c, tm, wm
+        daily_t, daily_c, tm, wm, \
+        today_bedrock_cost + 0, today_api_cost + 0, \
+        week_bedrock_cost + 0, week_api_cost + 0, \
+        month_bedrock_cost + 0, month_api_cost + 0, \
+        today_bedrock_tokens + 0, today_anthropic_tokens + 0, \
+        week_bedrock_tokens + 0, week_anthropic_tokens + 0
 }')
 
 # Empty pipeline = no assistant messages found. Emit zero summary so the
@@ -289,13 +360,17 @@ if [ -z "$RESULT" ]; then
     exit 0
 fi
 
-IFS=$'\t' read -r TODAY_TOK TODAY_COST WEEK_TOK WEEK_COST WEEK_MSGS WEEK_SESS MONTH_TOK MONTH_COST DAILY_TOK DAILY_COST TODAY_PM WEEK_PM <<<"$RESULT"
+IFS=$'\t' read -r TODAY_TOK TODAY_COST WEEK_TOK WEEK_COST WEEK_MSGS WEEK_SESS MONTH_TOK MONTH_COST DAILY_TOK DAILY_COST TODAY_PM WEEK_PM \
+    TODAY_BEDROCK_COST TODAY_API_COST WEEK_BEDROCK_COST WEEK_API_COST MONTH_BEDROCK_COST MONTH_API_COST \
+    TODAY_BEDROCK_TOK TODAY_ANTHROPIC_TOK WEEK_BEDROCK_TOK WEEK_ANTHROPIC_TOK <<<"$RESULT"
 
 mkdir -p "$(dirname "$OUT")"
 jq -n \
     --arg host "$HOSTNAME_NOW" \
     --arg profile "$PROFILE" \
     --arg generated "$GENERATED" \
+    --arg billing "$ANTHROPIC_BILLING" \
+    --arg subtype "$SUBSCRIPTION_TYPE" \
     --argjson today_tokens "$TODAY_TOK" \
     --argjson today_cost "$TODAY_COST" \
     --argjson week_tokens "$WEEK_TOK" \
@@ -308,6 +383,16 @@ jq -n \
     --argjson daily_costs "$DAILY_COST" \
     --argjson today_per_model "$TODAY_PM" \
     --argjson week_per_model "$WEEK_PM" \
+    --argjson today_bedrock_cost "$TODAY_BEDROCK_COST" \
+    --argjson today_api_cost "$TODAY_API_COST" \
+    --argjson week_bedrock_cost "$WEEK_BEDROCK_COST" \
+    --argjson week_api_cost "$WEEK_API_COST" \
+    --argjson month_bedrock_cost "$MONTH_BEDROCK_COST" \
+    --argjson month_api_cost "$MONTH_API_COST" \
+    --argjson today_bedrock_tokens "$TODAY_BEDROCK_TOK" \
+    --argjson today_anthropic_tokens "$TODAY_ANTHROPIC_TOK" \
+    --argjson week_bedrock_tokens "$WEEK_BEDROCK_TOK" \
+    --argjson week_anthropic_tokens "$WEEK_ANTHROPIC_TOK" \
     '{host: $host, profile: $profile, generated_at: $generated,
       today_tokens: $today_tokens, today_cost_usd: $today_cost,
       today_per_model: $today_per_model,
@@ -315,5 +400,11 @@ jq -n \
       week_messages: $week_messages, week_sessions: $week_sessions,
       week_per_model: $week_per_model,
       month_tokens: $month_tokens, month_cost_usd: $month_cost,
-      daily_tokens: $daily_tokens, daily_costs: $daily_costs}' \
+      daily_tokens: $daily_tokens, daily_costs: $daily_costs,
+      anthropic_billing: $billing, subscription_type: $subtype,
+      today_bedrock_cost_usd: $today_bedrock_cost, today_api_cost_usd: $today_api_cost,
+      week_bedrock_cost_usd: $week_bedrock_cost,   week_api_cost_usd: $week_api_cost,
+      month_bedrock_cost_usd: $month_bedrock_cost, month_api_cost_usd: $month_api_cost,
+      today_bedrock_tokens: $today_bedrock_tokens, today_anthropic_tokens: $today_anthropic_tokens,
+      week_bedrock_tokens: $week_bedrock_tokens,   week_anthropic_tokens: $week_anthropic_tokens}' \
     > "$OUT.tmp" && mv "$OUT.tmp" "$OUT"

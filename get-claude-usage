@@ -52,6 +52,19 @@ WORK_TODAY_COST="0.00"
 WORK_WEEK_COST="0.00"
 WORK_MONTH_COST="0.00"
 
+# Backend-split work costs. Bedrock = real AWS $ (us. cross-region rate).
+# API = Anthropic list price, which is the real charge only under an API
+# key; under a flat subscription (WORK_ANTHROPIC_BILLING=subscription) the
+# marginal cost is $0 and the widget should show utilization, not dollars.
+WORK_BEDROCK_TODAY_COST="0.00"
+WORK_BEDROCK_WEEK_COST="0.00"
+WORK_BEDROCK_MONTH_COST="0.00"
+WORK_API_TODAY_COST="0.00"
+WORK_API_WEEK_COST="0.00"
+WORK_API_MONTH_COST="0.00"
+WORK_ANTHROPIC_BILLING="unknown"
+WORK_SUBSCRIPTION_TYPE=""
+
 ALLTIME_SESSIONS=0
 ALLTIME_MESSAGES=0
 FIRST_SESSION="unknown"
@@ -64,27 +77,31 @@ refresh_pricing() {
     # Dynamically extract pricing for all Claude model families
     # Pattern: "claude-{family}-{major}-{minor}" (no date suffix, no provider prefix)
     # Groups by family name, takes the latest version per family
+    # `models` = Anthropic list rate (msg_01*/API key). `bedrock_models` =
+    # us.* cross-region inference-profile rate (msg_bdrk_*), ~10% above the
+    # base SKU and what this deployment invokes (us-east-2). Both group by
+    # family, latest version.
     local result
-    result=$(echo "$raw" | jq -c '{
-        updated: "'"$TODAY"'",
-        models: ([to_entries[]
-            | select(.key | test("^claude-[a-z]+-[0-9]+-[0-9]+$"))
-            | select(.value.input_cost_per_token > 0)
-            | {
-                family: (.key | split("-") | .[1]),
-                key: .key,
-                value: .value
-              }
-        ] | group_by(.family)
-          | map(sort_by(.key) | last
-              | {key: .family, value: {
-                    input: .value.input_cost_per_token,
-                    output: .value.output_cost_per_token,
-                    cache_read: .value.cache_read_input_token_cost,
-                    cache_write: .value.cache_creation_input_token_cost
-                }})
-          | from_entries)
-    }' 2>/dev/null) || return 1
+    result=$(echo "$raw" | jq -c '
+        def latest_per_family(re):
+            [ to_entries[]
+              | select(.key | test(re))
+              | select(.value.input_cost_per_token > 0)
+              | { family: (.key | split("-") | .[1]), key: .key, value: .value } ]
+            | group_by(.family)
+            | map(sort_by(.key) | last
+                | {key: .family, value: {
+                      input: .value.input_cost_per_token,
+                      output: .value.output_cost_per_token,
+                      cache_read: .value.cache_read_input_token_cost,
+                      cache_write: .value.cache_creation_input_token_cost
+                  }})
+            | from_entries;
+        {
+            updated: "'"$TODAY"'",
+            models: latest_per_family("^claude-[a-z]+-[0-9]+-[0-9]+$"),
+            bedrock_models: latest_per_family("^us\\.anthropic\\.claude-[a-z]+-[0-9]")
+        }' 2>/dev/null) || return 1
     # Fetch USD→EUR exchange rate from ECB via Frankfurter
     local eur_rate
     eur_rate=$(curl -s --max-time 5 "https://api.frankfurter.app/latest?from=USD&to=EUR" 2>/dev/null \
@@ -102,7 +119,9 @@ refresh_pricing() {
 
 if [ -f "$PRICING_CACHE" ]; then
     cached_date=$(jq -r '.updated // ""' "$PRICING_CACHE" 2>/dev/null || echo "")
-    if [ "$cached_date" != "$TODAY" ]; then
+    # Refresh on a new day OR when the cache predates the bedrock_models
+    # schema (so the Bedrock rate table gets populated on upgrade).
+    if [ "$cached_date" != "$TODAY" ] || ! jq -e '.bedrock_models' "$PRICING_CACHE" >/dev/null 2>&1; then
         refresh_pricing || true
     fi
     PRICING_JSON=$(cat "$PRICING_CACHE")
@@ -376,6 +395,28 @@ if [ -d "$CLAUDE_SUMMARIES_DIR" ]; then
         WORK_TODAY_COST=$(awk -v a="$WORK_TODAY_COST" -v b="$s_today_cost" 'BEGIN{printf "%.2f", a + b}')
         WORK_WEEK_COST=$(awk  -v a="$WORK_WEEK_COST"  -v b="$s_week_cost"  'BEGIN{printf "%.2f", a + b}')
         WORK_MONTH_COST=$(awk -v a="$WORK_MONTH_COST" -v b="$s_month_cost" 'BEGIN{printf "%.2f", a + b}')
+
+        # Backend split (fields absent on pre-upgrade summaries → 0).
+        sb_today=$(jq -r '.today_bedrock_cost_usd // 0' "$sum" 2>/dev/null || echo 0)
+        sb_week=$(jq -r  '.week_bedrock_cost_usd // 0'  "$sum" 2>/dev/null || echo 0)
+        sb_month=$(jq -r '.month_bedrock_cost_usd // 0' "$sum" 2>/dev/null || echo 0)
+        sa_today=$(jq -r '.today_api_cost_usd // 0'     "$sum" 2>/dev/null || echo 0)
+        sa_week=$(jq -r  '.week_api_cost_usd // 0'      "$sum" 2>/dev/null || echo 0)
+        sa_month=$(jq -r '.month_api_cost_usd // 0'     "$sum" 2>/dev/null || echo 0)
+        WORK_BEDROCK_TODAY_COST=$(awk -v a="$WORK_BEDROCK_TODAY_COST" -v b="$sb_today" 'BEGIN{printf "%.2f", a + b}')
+        WORK_BEDROCK_WEEK_COST=$(awk  -v a="$WORK_BEDROCK_WEEK_COST"  -v b="$sb_week"  'BEGIN{printf "%.2f", a + b}')
+        WORK_BEDROCK_MONTH_COST=$(awk -v a="$WORK_BEDROCK_MONTH_COST" -v b="$sb_month" 'BEGIN{printf "%.2f", a + b}')
+        WORK_API_TODAY_COST=$(awk -v a="$WORK_API_TODAY_COST" -v b="$sa_today" 'BEGIN{printf "%.2f", a + b}')
+        WORK_API_WEEK_COST=$(awk  -v a="$WORK_API_WEEK_COST"  -v b="$sa_week"  'BEGIN{printf "%.2f", a + b}')
+        WORK_API_MONTH_COST=$(awk -v a="$WORK_API_MONTH_COST" -v b="$sa_month" 'BEGIN{printf "%.2f", a + b}')
+
+        # Billing mode: any host reporting a subscription wins (flat plan ⇒
+        # API-side marginal cost is $0). subtype is the richest seen.
+        s_billing=$(jq -r '.anthropic_billing // "unknown"' "$sum" 2>/dev/null || echo "unknown")
+        s_subtype=$(jq -r '.subscription_type // ""' "$sum" 2>/dev/null || echo "")
+        if [ "$s_billing" = "subscription" ]; then WORK_ANTHROPIC_BILLING="subscription"; fi
+        if [ "$WORK_ANTHROPIC_BILLING" = "unknown" ] && [ "$s_billing" != "unknown" ]; then WORK_ANTHROPIC_BILLING="$s_billing"; fi
+        [ -n "$s_subtype" ] && WORK_SUBSCRIPTION_TYPE="$s_subtype"
     done
 fi
 
@@ -441,6 +482,14 @@ echo "MONTH_COST=${MONTH_COST}"
 echo "WORK_TODAY_COST=${WORK_TODAY_COST}"
 echo "WORK_WEEK_COST=${WORK_WEEK_COST}"
 echo "WORK_MONTH_COST=${WORK_MONTH_COST}"
+echo "WORK_BEDROCK_TODAY_COST=${WORK_BEDROCK_TODAY_COST}"
+echo "WORK_BEDROCK_WEEK_COST=${WORK_BEDROCK_WEEK_COST}"
+echo "WORK_BEDROCK_MONTH_COST=${WORK_BEDROCK_MONTH_COST}"
+echo "WORK_API_TODAY_COST=${WORK_API_TODAY_COST}"
+echo "WORK_API_WEEK_COST=${WORK_API_WEEK_COST}"
+echo "WORK_API_MONTH_COST=${WORK_API_MONTH_COST}"
+echo "WORK_ANTHROPIC_BILLING=${WORK_ANTHROPIC_BILLING}"
+echo "WORK_SUBSCRIPTION_TYPE=${WORK_SUBSCRIPTION_TYPE}"
 echo "DAILY_COSTS=${DAILY_COSTS}"
 echo "USD_EUR_RATE=${USD_EUR_RATE}"
 echo "HOST_BREAKDOWN=${HOST_BREAKDOWN}"
