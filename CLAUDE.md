@@ -19,7 +19,7 @@ Two components communicate over `stdout` via simple `KEY=VALUE` lines:
    - LiteLLM model price catalog + Frankfurter USD→EUR rate (refreshed once/day, cached in `~/.claude/pricing-cache.json`)
    - `~/.claude/stats-cache.json` → all-time session/message counts (read-only; written by something else)
 
-2. **`claude-usage-summary`** (bash) — per-host, per-profile transcript summarizer. Scans `$HOME/.claude{,-work}/projects/**/*.jsonl` (same `find | jq | awk` shape as `get-claude-usage` but scoped to one profile), emits a single JSON file at `--out PATH`. Invoked by a systemd user timer on each host that runs Claude. The DMS widget on the bar host doesn't run this directly — `get-claude-usage` reads the resulting summary.json files from `/mnt/claude/${HOST}/{personal,work}/summary.json` instead of crawling every host's JSONL itself. Keeps the NAS platter drives quiet during widget polling.
+2. **`claude-usage-summary`** (bash) — per-host, per-profile transcript summarizer. Scans `$HOME/.claude{,-work}/projects/**/*.jsonl` (same jq filter and awk aggregation as `get-claude-usage` but scoped to one profile), emits a single JSON file at `--out PATH`. Incremental: extracted rows are cached per transcript under `${XDG_CACHE_HOME:-~/.cache}/claude-usage-summary/` with a manifest of (inode, parsed-through offset), so each run reads only bytes appended since the last run; a shrunk or replaced file is reparsed from scratch, and a `flock` keeps concurrent runs from interleaving. Invoked by a systemd user timer on each host that runs Claude. The DMS widget on the bar host doesn't run this directly — `get-claude-usage` reads the resulting summary.json files from `/mnt/claude/${HOST}/{personal,work}/summary.json` instead of crawling every host's JSONL itself. Keeps the NAS platter drives quiet during widget polling.
 
 3. **`ClaudeCodeUsageWidget.qml`** — the UI. A `PluginComponent` that runs `get-claude-usage` via `Process` on a timer (`refreshInterval` minutes), parses each stdout line in `parseLine()`, and renders the pill + popout. Imports `qs.Common`, `qs.Services`, `qs.Widgets`, `qs.Modules.Plugins` from DMS — these are not in this repo and only resolve at runtime inside DMS.
 
@@ -52,7 +52,7 @@ for t in tests/test-*.sh; do bash "$t"; done
 bash tests/test-get-claude-usage.sh
 
 # ShellCheck (matches CI)
-shellcheck get-claude-usage tests/*.sh
+shellcheck get-claude-usage claude-usage-summary tests/*.sh
 ```
 
 Tests are pure bash + Node and require only `jq` and `node`. `test-get-claude-usage.sh` builds an isolated `$HOME` under a `mktemp -d` and prepends a mock `curl` to `$PATH` so no real network calls happen. `test-qml-functions.sh` extracts pure-JS helper functions (`formatTokens`, `formatCost`, `formatTier`, `progressColor`, `shortModelName`) from the QML file and exercises them under Node.

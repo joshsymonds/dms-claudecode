@@ -19,6 +19,10 @@ assert_eq() {
 TMPDIR_ROOT=$(mktemp -d)
 trap 'rm -rf "$TMPDIR_ROOT"' EXIT
 
+# The row cache lives under ${XDG_CACHE_HOME:-$HOME/.cache}; unset it so
+# each test's isolated $HOME gets its own cache instead of the real one.
+unset XDG_CACHE_HOME
+
 # ISO date for today + this week's Monday (matches the script's
 # calendar-week semantics).
 TODAY=$(date +%Y-%m-%d)
@@ -378,6 +382,118 @@ assert_eq "$(jq -r .anthropic_billing "$OUT14")"      "subscription" "subscripti
 assert_eq "$(jq -r .subscription_type "$OUT14")"      "max" "subscription type captured"
 assert_eq "$(jq -r .today_bedrock_tokens "$OUT14")"   "1000" "bedrock tokens split out"
 assert_eq "$(jq -r .today_anthropic_tokens "$OUT14")" "1000" "anthropic tokens split out"
+
+# ============================================================
+echo "=== Test 15: appended rows are picked up from the cache ==="
+# ============================================================
+ENV15=$(setup_env "test15")
+JSONL="$ENV15/.claude/projects/test-project/sess-1.jsonl"
+make_jsonl_line_with_id "$TODAY" "claude-opus-4-7-20260101" 1000 0 0 0 "msg_A" > "$JSONL"
+OUT15="$TMPDIR_ROOT/test15.json"
+run_script "$ENV15" personal "$OUT15"
+assert_eq "$(jq -r .today_tokens "$OUT15")" "1000" "cold run counts the first row"
+run_script "$ENV15" personal "$OUT15"
+assert_eq "$(jq -r .today_tokens "$OUT15")" "1000" "warm run with no change is stable"
+make_jsonl_line_with_id "$TODAY" "claude-opus-4-7-20260101" 500 0 0 0 "msg_B" >> "$JSONL"
+run_script "$ENV15" personal "$OUT15"
+assert_eq "$(jq -r .today_tokens "$OUT15")" "1500" "appended row added once"
+assert_eq "$(jq -r .week_messages "$OUT15")" "2" "week_messages counts both rows"
+
+# ============================================================
+echo "=== Test 16: a partially written last line is not lost or doubled ==="
+# ============================================================
+ENV16=$(setup_env "test16")
+JSONL="$ENV16/.claude/projects/test-project/sess-1.jsonl"
+LINE=$(make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 700 0 0 0)
+make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 100 0 0 0 > "$JSONL"
+# Complete JSON object with its newline not yet written: parseable, but it
+# must wait until the line is finished. Rows without message.id are not
+# deduped, so reading it early would count it twice.
+printf '%s' "$LINE" >> "$JSONL"
+OUT16="$TMPDIR_ROOT/test16.json"
+run_script "$ENV16" personal "$OUT16"
+assert_eq "$(jq -r .today_tokens "$OUT16")" "100" "unterminated line held back"
+printf '\n' >> "$JSONL"
+run_script "$ENV16" personal "$OUT16"
+assert_eq "$(jq -r .today_tokens "$OUT16")" "800" "line counted once after its newline lands"
+run_script "$ENV16" personal "$OUT16"
+assert_eq "$(jq -r .today_tokens "$OUT16")" "800" "and not again on the next run"
+
+# ============================================================
+echo "=== Test 17: rewritten or truncated file is reparsed from scratch ==="
+# ============================================================
+ENV17=$(setup_env "test17")
+JSONL="$ENV17/.claude/projects/test-project/sess-1.jsonl"
+{
+    make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 1000 0 0 0
+    make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 2000 0 0 0
+} > "$JSONL"
+OUT17="$TMPDIR_ROOT/test17.json"
+run_script "$ENV17" personal "$OUT17"
+assert_eq "$(jq -r .today_tokens "$OUT17")" "3000" "both rows counted"
+# Shorter content in place (same inode, smaller size).
+make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 300 0 0 0 > "$JSONL"
+run_script "$ENV17" personal "$OUT17"
+assert_eq "$(jq -r .today_tokens "$OUT17")" "300" "truncated file reparsed"
+# Replaced by a new file (new inode) of the same size class.
+NEW="$JSONL.new"
+make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 400 0 0 0 > "$NEW"
+mv "$NEW" "$JSONL"
+run_script "$ENV17" personal "$OUT17"
+assert_eq "$(jq -r .today_tokens "$OUT17")" "400" "replaced file reparsed"
+
+# ============================================================
+echo "=== Test 18: deleted and aged-out files drop out ==="
+# ============================================================
+ENV18=$(setup_env "test18")
+DIR18="$ENV18/.claude/projects/test-project"
+make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 1000 0 0 0 > "$DIR18/a.jsonl"
+make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 200 0 0 0 > "$DIR18/b.jsonl"
+make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 30 0 0 0 > "$DIR18/c.jsonl"
+OUT18="$TMPDIR_ROOT/test18.json"
+run_script "$ENV18" personal "$OUT18"
+assert_eq "$(jq -r .today_tokens "$OUT18")" "1230" "three files counted"
+rm "$DIR18/a.jsonl"
+touch -d "40 days ago" "$DIR18/b.jsonl"
+run_script "$ENV18" personal "$OUT18"
+assert_eq "$(jq -r .today_tokens "$OUT18")" "30" "deleted and >31-day files excluded"
+CACHE18=$(find "$ENV18/.cache/claude-usage-summary" -mindepth 1 -maxdepth 1 -type d)
+assert_eq "$(find "$CACHE18/rows" -type f | wc -l | tr -d ' ')" "1" "their cached rows are removed"
+assert_eq "$(wc -l < "$CACHE18/manifest" | tr -d ' ')" "1" "manifest tracks only the live file"
+
+# ============================================================
+echo "=== Test 19: interrupted run is rolled back, not double-counted ==="
+# ============================================================
+ENV19=$(setup_env "test19")
+JSONL="$ENV19/.claude/projects/test-project/sess-1.jsonl"
+make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 100 0 0 0 > "$JSONL"
+OUT19="$TMPDIR_ROOT/test19.json"
+run_script "$ENV19" personal "$OUT19"
+make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 20 0 0 0 >> "$JSONL"
+# Simulate a run that appended rows but died before writing the manifest.
+CACHE19=$(find "$ENV19/.cache/claude-usage-summary" -mindepth 1 -maxdepth 1 -type d)
+ROWS19=$(find "$CACHE19/rows" -type f)
+LAST19=$(tail -n 1 "$ROWS19")
+printf '%s\n' "${LAST19/ 100 / 20 }" >> "$ROWS19"
+run_script "$ENV19" personal "$OUT19"
+assert_eq "$(jq -r .today_tokens "$OUT19")" "120" "stale appended rows discarded before reparse"
+
+# ============================================================
+echo "=== Test 20: concurrent run skips instead of interleaving ==="
+# ============================================================
+ENV20=$(setup_env "test20")
+make_jsonl_line "$TODAY" "claude-opus-4-7-20260101" 1000 0 0 0 > "$ENV20/.claude/projects/test-project/s.jsonl"
+OUT20="$TMPDIR_ROOT/test20.json"
+run_script "$ENV20" personal "$OUT20"
+rm "$OUT20"
+CACHE20=$(find "$ENV20/.cache/claude-usage-summary" -mindepth 1 -maxdepth 1 -type d)
+(
+    flock 9
+    run_script "$ENV20" personal "$OUT20" 2>/dev/null
+) 9>"$CACHE20/lock"
+if [ ! -f "$OUT20" ]; then pass "run skipped while the lock is held"; else fail "run did not respect the lock"; fi
+run_script "$ENV20" personal "$OUT20"
+assert_eq "$(jq -r .today_tokens "$OUT20")" "1000" "next run after release writes the summary"
 
 # ============================================================
 echo "=========================================="

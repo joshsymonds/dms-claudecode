@@ -30,7 +30,16 @@
 #     "daily_costs":  [Mon..Sun]
 #   }
 #
-# No `set -o pipefail` on the big find|jq|awk pipeline — partial-file
+# Incremental: each transcript's extracted rows are cached locally under
+# ${XDG_CACHE_HOME:-~/.cache}/claude-usage-summary/, and a run parses only
+# the bytes appended since the last one. Transcripts are append-only JSONL,
+# so a file whose inode is unchanged and whose size has not shrunk only
+# needs its tail read; anything else is reparsed from byte 0. Without this,
+# every run re-read the whole 31-day window (26 GB / 86k files on
+# vermissian, Oct 2026) off the NAS, took longer than the 10-minute timer
+# period, and kept the platters seeking around the clock.
+#
+# No `set -o pipefail` on the extract/aggregate pipelines — partial-file
 # tolerance matches the get-claude-usage convention.
 set -eu
 
@@ -187,14 +196,10 @@ for i in 0 1 2 3 4 5 6; do
     DAY_DATES="${DAY_DATES:+${DAY_DATES},}${d}"
 done
 
-# Single pass: extract granular tokens per assistant message, aggregate
-# with awk. JSON encoding is built up by awk (no second jq round-trip).
-# `find -H` follows the start path if it's a symlink (PROJECTS is
-# typically ~/.claude/projects -> /mnt/claude/$HOST/personal/projects)
-# but does NOT follow symlinks encountered during traversal — avoids
-# the classic "find returns nothing because PROJECTS is a symlink" trap.
-RESULT=$(find -H "$PROJECTS" -name '*.jsonl' -mtime -31 -exec cat {} + 2>/dev/null \
-    | jq -r -R 'fromjson?
+# Extract granular tokens per assistant message as one space-separated row
+# per message. Each output line is prefixed with the chunk file it came
+# from and a tab, so one jq invocation can serve every changed file.
+EXTRACT_JQ='fromjson?
         # Canonical filter set, ported from ccusage v15.0.0 src/data-loader.ts:
         #   - .type == "assistant" (only billed responses; user/system/etc. are free)
         #   - .isSidechain != true   (subagent re-logs of the parent conversation
@@ -210,12 +215,12 @@ RESULT=$(find -H "$PROJECTS" -name '*.jsonl' -mtime -31 -exec cat {} + 2>/dev/nu
                  and (.message.usage // null) != null)
         # Emit LOCAL date (TZ of the machine running this script), not the
         # UTC prefix of the timestamp. Anthropic/Bedrock JSONL timestamps
-        # are UTC; comparing their date prefix against bash $TODAY (which
+        # are UTC; comparing their date prefix against the bash TODAY (which
         # is local-tz) mis-classified ~7h of late-local-yesterday activity
         # as "today" for PDT users. fromdateiso8601 needs the milliseconds
         # stripped, hence the [:19] + "Z" trim.
         #
-        # Dedup key is `message.id:requestId`, also ported from ccusage
+        # Dedup key is "message.id:requestId", also ported from ccusage
         # (issue #389): Claude Code emits the SAME message.id twice per
         # assistant turn (once for the text part and once for the
         # tool_use part) with identical usage blocks. Both carry the
@@ -223,10 +228,128 @@ RESULT=$(find -H "$PROJECTS" -name '*.jsonl' -mtime -31 -exec cat {} + 2>/dev/nu
         # / "no-req" fallbacks are kept distinct so legacy fixtures
         # without these fields are not all collapsed into one row.
         # Trailing field is the BACKEND, derived from message.id: Bedrock
-        # stamps a `msg_bdrk_` prefix, the Anthropic API uses `msg_01...`.
+        # stamps a "msg_bdrk_" prefix, the Anthropic API uses "msg_01...".
         # This is the only per-message signal of which backend (and thus
         # which bill — AWS vs Anthropic) served the response.
-        | "\(((.timestamp[:19]) + "Z") | fromdateiso8601 | localtime | strftime("%Y-%m-%d")) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0) \(.sessionId // "unknown") \(.message.id // "no-id"):\(.requestId // "no-req") \((.message.id // "") | if startswith("msg_bdrk") then "bedrock" else "anthropic" end)"' \
+        | "\(input_filename)\t\(((.timestamp[:19]) + "Z") | fromdateiso8601 | localtime | strftime("%Y-%m-%d")) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0) \(.sessionId // "unknown") \(.message.id // "no-id"):\(.requestId // "no-req") \((.message.id // "") | if startswith("msg_bdrk") then "bedrock" else "anthropic" end)"'
+
+# Rows are cached per (schema, profile, projects dir, timezone): the date
+# column is computed in local time at extraction, so a TZ change has to
+# start a fresh cache rather than reuse rows bucketed under the old one.
+CACHE_SCHEMA=1
+CACHE_KEY=$(printf '%s\n' "$CACHE_SCHEMA" "$PROFILE" "$(readlink -f "$PROJECTS")" \
+    "${TZ:-$(readlink -f /etc/localtime 2>/dev/null || true)}" | sha1sum | cut -c1-16)
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/claude-usage-summary/$CACHE_KEY"
+ROWS="$CACHE/rows"
+CHUNKS="$CACHE/chunks"
+MANIFEST="$CACHE/manifest"
+mkdir -p "$ROWS"
+
+# One run at a time per cache. A second invocation (a manual run during a
+# timer run) would otherwise interleave appends into the same rows files.
+exec 9>"$CACHE/lock"
+if ! flock -n 9; then
+    echo "claude-usage-summary: another run holds $CACHE/lock; skipping" >&2
+    exit 0
+fi
+
+# Manifest: one line per tracked transcript —
+#   path \t inode \t parsed-through byte offset \t cache id \t rows-file length
+# The offset only ever advances to just past a newline, so a line that is
+# still being written is picked up whole on the next run. The rows-file
+# length lets a run that died between appending rows and writing the
+# manifest be rolled back instead of double-counted.
+declare -A M_INO M_OFF M_ID M_RLEN
+NEXT_ID=1
+if [ -f "$MANIFEST" ]; then
+    while IFS=$'\t' read -r p ino off id rlen; do
+        M_INO["$p"]=$ino; M_OFF["$p"]=$off; M_ID["$p"]=$id; M_RLEN["$p"]=$rlen
+        if [ "$id" -ge "$NEXT_ID" ]; then NEXT_ID=$((id + 1)); fi
+    done < "$MANIFEST"
+fi
+
+# Parse every pending chunk in one jq pass and append each row to its
+# file's rows cache. jq reads a chunk start to finish, so one file's rows
+# arrive contiguously and in line order. Chunks are flushed in ~256 MB
+# batches so a cold run (every file new) doesn't stage the whole window on
+# local disk at once.
+CHUNK_BYTES=0
+flush_chunks() {
+    find "$CHUNKS" -type f -size +0 -exec jq -r -R "$EXTRACT_JQ" {} + 2>/dev/null \
+        | awk -F'\t' -v rows="$ROWS" '
+            $1 != prev { if (prev != "") close(f); n = split($1, parts, "/"); f = rows "/" parts[n]; prev = $1 }
+            { print $2 >> f }' || true
+    rm -rf "$CHUNKS"
+    mkdir -p "$CHUNKS"
+    CHUNK_BYTES=0
+}
+
+rm -rf "$CHUNKS"
+mkdir -p "$CHUNKS"
+
+# `find -H` follows the start path if it's a symlink (PROJECTS is
+# typically ~/.claude/projects -> /mnt/claude/$HOST/personal/projects)
+# but does NOT follow symlinks encountered during traversal — avoids
+# the classic "find returns nothing because PROJECTS is a symlink" trap.
+ORDER=()
+P_OF=(); INO_OF=(); OFF_OF=(); RLEN_OF=()
+CHANGED=()
+declare -A LIVE
+while IFS=$'\t' read -r ino size p; do
+    if [ -n "${M_ID[$p]:-}" ]; then id=${M_ID[$p]}; else id=$NEXT_ID; NEXT_ID=$((NEXT_ID + 1)); fi
+    if [ "${M_INO[$p]:-}" = "$ino" ] && [ "$size" -ge "${M_OFF[$p]}" ]; then
+        off=${M_OFF[$p]}; rlen=${M_RLEN[$p]}
+    else
+        # New, replaced, or truncated: start over from byte 0.
+        off=0; rlen=0
+    fi
+    if [ "$size" -gt "$off" ]; then
+        rows="$ROWS/$id"
+        if [ -e "$rows" ]; then truncate -s "$rlen" "$rows"; fi
+        chunk="$CHUNKS/$id"
+        tail -c +"$((off + 1))" "$p" 2>/dev/null | head -c "$((size - off))" > "$chunk" || true
+        len=$(wc -c < "$chunk")
+        # $(...) strips a trailing newline, so a non-empty last byte means
+        # the chunk ends mid-line: hold that partial line back.
+        if [ "$len" -gt 0 ] && [ -n "$(tail -c 1 "$chunk")" ]; then
+            len=$((len - $(tail -n 1 "$chunk" | wc -c)))
+            truncate -s "$len" "$chunk"
+        fi
+        off=$((off + len))
+        CHANGED+=("$id")
+        CHUNK_BYTES=$((CHUNK_BYTES + len))
+        if [ "$CHUNK_BYTES" -ge 268435456 ]; then flush_chunks; fi
+    fi
+    ORDER+=("$id")
+    LIVE[$id]=1
+    P_OF[id]=$p; INO_OF[id]=$ino; OFF_OF[id]=$off; RLEN_OF[id]=$rlen
+done < <(find -H "$PROJECTS" -name '*.jsonl' -mtime -31 -printf '%i\t%s\t%p\n' 2>/dev/null)
+flush_chunks
+rm -rf "$CHUNKS"
+
+for id in "${CHANGED[@]}"; do
+    RLEN_OF[id]=$(stat -c %s "$ROWS/$id" 2>/dev/null || echo 0)
+done
+
+{
+    for id in "${ORDER[@]}"; do
+        printf '%s\t%s\t%s\t%s\t%s\n' "${P_OF[id]}" "${INO_OF[id]}" "${OFF_OF[id]}" "$id" "${RLEN_OF[id]}"
+    done
+} > "$MANIFEST.tmp"
+mv "$MANIFEST.tmp" "$MANIFEST"
+
+# Drop the rows of transcripts that aged out of the window or were deleted.
+for p in "${!M_ID[@]}"; do
+    id=${M_ID[$p]}
+    if [ -z "${LIVE[$id]:-}" ]; then rm -f "$ROWS/$id"; fi
+done
+
+# Aggregate the cached rows with awk, in find order so dedup keeps the same
+# first occurrence a full rescan would. JSON encoding is built up by awk
+# (no second jq round-trip).
+RESULT=$(for id in "${ORDER[@]}"; do
+        if [ -s "$ROWS/$id" ]; then printf '%s\0' "$ROWS/$id"; fi
+    done | xargs -0 -r cat \
     | awk -v today="$TODAY" -v week_start="$WEEK_START" -v month_start="$MONTH_START" -v day_dates="$DAY_DATES" -v pricing="$PRICING_AWK" -v pricing_bedrock="$PRICING_BEDROCK_AWK" '
 BEGIN {
     split(day_dates, dates, ",")
